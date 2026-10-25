@@ -422,6 +422,11 @@ func setupSeedTableTestDB(t *testing.T, models ...interface{}) *gorm.DB {
 func TestSeedChainTokensIncludesNativeCoins(t *testing.T) {
 	db := setupSeedTableTestDB(t, &mdb.ChainToken{})
 	Mdb = db
+	// viper is process-global and other seed tests set api_rate_url; clear it so a
+	// fresh fixed-rate install is what this test actually exercises.
+	previousRateURL := viper.GetString("api_rate_url")
+	viper.Set("api_rate_url", "")
+	t.Cleanup(func() { viper.Set("api_rate_url", previousRateURL) })
 
 	seedChainTokens()
 
@@ -436,6 +441,11 @@ func TestSeedChainTokensIncludesNativeCoins(t *testing.T) {
 		}
 		if row.Decimals != 18 {
 			t.Fatalf("%s decimals = %d, want 18", key, row.Decimals)
+		}
+		// seedNativeTokenEnabled is only true in auto mode, and these tests run on a
+		// fresh fixed-rate DB, so the explicit follow-up write must have won.
+		if row.Enabled {
+			t.Fatalf("%s enabled = true, want false on a fresh fixed-rate install", key)
 		}
 	}
 

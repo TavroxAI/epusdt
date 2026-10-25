@@ -2,6 +2,7 @@ package dao
 
 import (
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -9,6 +10,7 @@ import (
 	"github.com/GMWalletApp/epusdt/config"
 	"github.com/GMWalletApp/epusdt/model/mdb"
 	"github.com/gookit/color"
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -95,12 +97,9 @@ func seedChainTokens() {
 		{Network: mdb.NetworkEthereum, Symbol: "USDT", ContractAddress: "0xdAC17F958D2ee523a2206206994597C13D831ec7", Decimals: 6, Enabled: true},
 		{Network: mdb.NetworkEthereum, Symbol: "USDC", ContractAddress: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", Decimals: 6, Enabled: true},
 		// Native coins are the only contract-less row a chain accepts; they are
-		// scanned from block transactions instead of Transfer logs. They can only
-		// be priced when rates are learned automatically, so a fresh fixed-rate
-		// install starts with them off rather than showing a method that fails
-		// with "rate calculation failed" until the operator adds a per-coin rate.
-		{Network: mdb.NetworkEthereum, Symbol: "ETH", ContractAddress: "", Decimals: 18, Enabled: seedNativeTokenEnabled()},
-		{Network: mdb.NetworkBsc, Symbol: "BNB", ContractAddress: "", Decimals: 18, Enabled: seedNativeTokenEnabled()},
+		// scanned from block transactions instead of Transfer logs. They are not
+		// part of the batch below: each one is created by ensureSeedNativeToken so
+		// its initial enabled state is written explicitly (see the comment there).
 		// Solana
 		{Network: mdb.NetworkSolana, Symbol: "USDT", ContractAddress: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", Decimals: 6, Enabled: true},
 		{Network: mdb.NetworkSolana, Symbol: "USDC", ContractAddress: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", Decimals: 6, Enabled: true},
@@ -123,22 +122,69 @@ func seedChainTokens() {
 	if err := Mdb.Clauses(clause.OnConflict{DoNothing: true}).Create(&defaults).Error; err != nil {
 		color.Red.Printf("[store_db] seed chain_tokens err=%s\n", err)
 	}
-	// The (network, symbol) unique index also covers soft-deleted rows, so the
-	// insert above silently skips a coin someone once deleted: the row still
-	// occupies the index while staying invisible in every list. Native coins are
-	// seed data and must not disappear that way, so unhide them here. Only
-	// deleted_at is cleared; the operator's enabled / contract_address /
-	// decimals values are left exactly as they are.
+	// Each native row is reconciled and logged on its own: the batch insert above
+	// is silent on conflict, and a silently skipped native coin is exactly the
+	// failure that is impossible to diagnose from the console (the row keeps the
+	// (network, symbol) unique index occupied, which also covers soft-deleted
+	// rows, while staying invisible in every list).
 	for _, native := range [][2]string{
 		{mdb.NetworkEthereum, "ETH"},
 		{mdb.NetworkBsc, "BNB"},
 	} {
-		if err := Mdb.Unscoped().Model(&mdb.ChainToken{}).
-			Where("network = ? AND symbol = ? AND deleted_at IS NOT NULL", native[0], native[1]).
-			Update("deleted_at", nil).Error; err != nil {
-			color.Red.Printf("[store_db] revive native token %s/%s err=%s\n", native[0], native[1], err)
-		}
+		ensureSeedNativeToken(native[0], native[1])
 	}
+}
+
+// ensureSeedNativeToken guarantees the native coin row exists and is visible.
+// It creates a missing row, revives a soft-deleted one, and leaves an existing
+// visible row completely alone (the operator's enabled / contract_address /
+// decimals always win). Every outcome is printed so an upgrade can be verified
+// from `journalctl -u epusdt`.
+func ensureSeedNativeToken(network, symbol string) {
+	var row mdb.ChainToken
+	err := Mdb.Unscoped().
+		Where("network = ? AND symbol = ?", network, symbol).
+		Take(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		enabled := seedNativeTokenEnabled()
+		row = mdb.ChainToken{
+			Network:         network,
+			Symbol:          symbol,
+			ContractAddress: "",
+			Decimals:        18,
+			Enabled:         enabled,
+		}
+		if createErr := Mdb.Create(&row).Error; createErr != nil {
+			color.Red.Printf("[store_db] seed native token %s/%s err=%s\n", network, symbol, createErr)
+			return
+		}
+		// Enabled is tagged default:true, and GORM omits a zero-value bool from the
+		// INSERT so the column default applies (and may write it straight back into
+		// the struct). A row that must start disabled therefore needs an explicit
+		// follow-up write; the intended value is captured above, not read back.
+		if !enabled {
+			if err := Mdb.Model(&mdb.ChainToken{}).Where("id = ?", row.ID).Update("enabled", false).Error; err != nil {
+				color.Red.Printf("[store_db] disable seeded native token %s/%s err=%s\n", network, symbol, err)
+			}
+		}
+		color.Cyan.Printf("[store_db] seeded native token %s/%s enabled=%t\n", network, symbol, enabled)
+		return
+	}
+	if err != nil {
+		color.Red.Printf("[store_db] lookup native token %s/%s err=%s\n", network, symbol, err)
+		return
+	}
+	if row.DeletedAt.Valid {
+		if reviveErr := Mdb.Unscoped().Model(&mdb.ChainToken{}).
+			Where("id = ?", row.ID).
+			Update("deleted_at", nil).Error; reviveErr != nil {
+			color.Red.Printf("[store_db] revive native token %s/%s err=%s\n", network, symbol, reviveErr)
+			return
+		}
+		color.Cyan.Printf("[store_db] revived soft-deleted native token %s/%s enabled=%t\n", network, symbol, row.Enabled)
+		return
+	}
+	color.Cyan.Printf("[store_db] native token %s/%s already present enabled=%t\n", network, symbol, row.Enabled)
 }
 
 // seedNativeTokenEnabled decides the initial state of the native coin rows
