@@ -48,10 +48,15 @@ func MdbTableInit() {
 			{"RpcNode", &mdb.RpcNode{}},
 			{"ProviderOrder", &mdb.ProviderOrder{}},
 		}
+		var failed []string
 		for _, m := range migrations {
 			if err := Mdb.AutoMigrate(m.model); err != nil {
+				// A failed ALTER on one table used to abort the whole init, which
+				// silently skipped every seed below it: the console then showed a
+				// token list without the built-in coins and no line explained why.
+				// Keep going and report the failures once the seeds are done.
 				color.Red.Printf("[store_db] AutoMigrate DB(%s),err=%s\n", m.name, err)
-				return
+				failed = append(failed, m.name)
 			}
 		}
 
@@ -61,6 +66,11 @@ func MdbTableInit() {
 		seedChainTokens()
 		seedDefaultSettings()
 		seedTelegramChannelFromSettings()
+
+		if len(failed) > 0 {
+			color.Red.Printf("[store_db] AutoMigrate failed for %d model(s): %s — seeds were applied anyway; check the schema of those tables\n",
+				len(failed), strings.Join(failed, ", "))
+		}
 	})
 }
 
