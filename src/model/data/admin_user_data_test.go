@@ -21,7 +21,7 @@ func TestUpsertSettingRowRestoresSoftDeletedSetting(t *testing.T) {
 	if err := upsertSettingRow(dao.Mdb, row); err != nil {
 		t.Fatalf("seed setting: %v", err)
 	}
-	if err := dao.Mdb.Where("`key` = ?", row.Key).Delete(&mdb.Setting{}).Error; err != nil {
+	if err := dao.Mdb.Where(map[string]any{"key": row.Key}).Delete(&mdb.Setting{}).Error; err != nil {
 		t.Fatalf("delete setting: %v", err)
 	}
 
@@ -31,7 +31,7 @@ func TestUpsertSettingRowRestoresSoftDeletedSetting(t *testing.T) {
 	}
 
 	var restored mdb.Setting
-	if err := dao.Mdb.Where("`key` = ?", row.Key).Take(&restored).Error; err != nil {
+	if err := dao.Mdb.Where(map[string]any{"key": row.Key}).Take(&restored).Error; err != nil {
 		t.Fatalf("load restored setting: %v", err)
 	}
 	if restored.Value != "true" {
@@ -62,7 +62,7 @@ func TestGetInitialAdminPasswordKeepsPlaintext(t *testing.T) {
 	var count int64
 	if err := dao.Mdb.Unscoped().
 		Model(&mdb.Setting{}).
-		Where("`key` = ?", mdb.SettingKeyInitAdminPasswordPlain).
+		Where(map[string]any{"key": mdb.SettingKeyInitAdminPasswordPlain}).
 		Count(&count).Error; err != nil {
 		t.Fatalf("count plaintext setting: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestUpdateAdminUserPasswordHardDeletesInitialPasswordPlaintext(t *testing.T
 	var count int64
 	if err := dao.Mdb.Unscoped().
 		Model(&mdb.Setting{}).
-		Where("`key` = ?", mdb.SettingKeyInitAdminPasswordPlain).
+		Where(map[string]any{"key": mdb.SettingKeyInitAdminPasswordPlain}).
 		Count(&count).Error; err != nil {
 		t.Fatalf("count plaintext setting: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestUpdateAdminUserPasswordHardDeletesPlaintextWithoutHashMetadata(t *testi
 	var count int64
 	if err := dao.Mdb.Unscoped().
 		Model(&mdb.Setting{}).
-		Where("`key` = ?", mdb.SettingKeyInitAdminPasswordPlain).
+		Where(map[string]any{"key": mdb.SettingKeyInitAdminPasswordPlain}).
 		Count(&count).Error; err != nil {
 		t.Fatalf("count plaintext setting: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestEnsureDefaultAdminPurgesLegacySoftDeletedPlaintext(t *testing.T) {
 	}).Error; err != nil {
 		t.Fatalf("seed plaintext setting: %v", err)
 	}
-	if err := dao.Mdb.Where("`key` = ?", mdb.SettingKeyInitAdminPasswordPlain).Delete(&mdb.Setting{}).Error; err != nil {
+	if err := dao.Mdb.Where(map[string]any{"key": mdb.SettingKeyInitAdminPasswordPlain}).Delete(&mdb.Setting{}).Error; err != nil {
 		t.Fatalf("soft delete plaintext setting: %v", err)
 	}
 
@@ -205,7 +205,7 @@ func TestEnsureDefaultAdminPurgesLegacySoftDeletedPlaintext(t *testing.T) {
 	var count int64
 	if err := dao.Mdb.Unscoped().
 		Model(&mdb.Setting{}).
-		Where("`key` = ?", mdb.SettingKeyInitAdminPasswordPlain).
+		Where(map[string]any{"key": mdb.SettingKeyInitAdminPasswordPlain}).
 		Count(&count).Error; err != nil {
 		t.Fatalf("count plaintext setting: %v", err)
 	}

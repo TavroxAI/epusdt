@@ -339,7 +339,7 @@ func TestAdminInitialPasswordMetadataFlow(t *testing.T) {
 	var plaintextRows int64
 	if err := dao.Mdb.Unscoped().
 		Model(&mdb.Setting{}).
-		Where("`key` = ?", mdb.SettingKeyInitAdminPasswordPlain).
+		Where(map[string]any{"key": mdb.SettingKeyInitAdminPasswordPlain}).
 		Count(&plaintextRows).Error; err != nil {
 		t.Fatalf("count init password plaintext rows: %v", err)
 	}
@@ -368,7 +368,7 @@ func TestAdminInitialPasswordMetadataFlow(t *testing.T) {
 	}
 	if err := dao.Mdb.Unscoped().
 		Model(&mdb.Setting{}).
-		Where("`key` = ?", mdb.SettingKeyInitAdminPasswordPlain).
+		Where(map[string]any{"key": mdb.SettingKeyInitAdminPasswordPlain}).
 		Count(&plaintextRows).Error; err != nil {
 		t.Fatalf("count init password plaintext rows after change: %v", err)
 	}
@@ -1595,7 +1595,7 @@ func TestAdminSettings_ForcedRateListValidation(t *testing.T) {
 		t.Fatalf("GetRateForCoin(USDT, CNY) = %v, want 0.14635", rate)
 	}
 	var row mdb.Setting
-	if err := dao.Mdb.Where("`key` = ?", mdb.SettingKeyRateForcedRateList).Take(&row).Error; err != nil {
+	if err := dao.Mdb.Where(map[string]any{"key": mdb.SettingKeyRateForcedRateList}).Take(&row).Error; err != nil {
 		t.Fatalf("load forced rate list: %v", err)
 	}
 	if row.Type != mdb.SettingTypeJSON {
@@ -1884,7 +1884,7 @@ func TestAdminSettings_LogLevelValidationRuntimeUpdateAndReset(t *testing.T) {
 	}
 
 	var restored mdb.Setting
-	if err := dao.Mdb.Unscoped().Where("`key` = ?", mdb.SettingKeySystemLogLevel).Take(&restored).Error; err != nil {
+	if err := dao.Mdb.Unscoped().Where(map[string]any{"key": mdb.SettingKeySystemLogLevel}).Take(&restored).Error; err != nil {
 		t.Fatalf("load restored system.log_level unscoped: %v", err)
 	}
 	if restored.DeletedAt.Valid {
@@ -1972,7 +1972,7 @@ func TestAdminSettings_AllowsEmptyRateAPIURLAndRestoresDefaultForcedRateList(t *
 	}
 
 	var apiRow mdb.Setting
-	if err := dao.Mdb.Where("`key` = ?", mdb.SettingKeyRateApiUrl).Take(&apiRow).Error; err != nil {
+	if err := dao.Mdb.Where(map[string]any{"key": mdb.SettingKeyRateApiUrl}).Take(&apiRow).Error; err != nil {
 		t.Fatalf("load rate.api_url: %v", err)
 	}
 	if apiRow.Value != "" {
@@ -2067,7 +2067,7 @@ func TestAdminSettings_DeleteThenReupsertRestoresSetting(t *testing.T) {
 	}
 
 	var restored mdb.Setting
-	if err := dao.Mdb.Unscoped().Where("`key` = ?", mdb.SettingKeyRateApiUrl).Take(&restored).Error; err != nil {
+	if err := dao.Mdb.Unscoped().Where(map[string]any{"key": mdb.SettingKeyRateApiUrl}).Take(&restored).Error; err != nil {
 		t.Fatalf("load restored setting unscoped: %v", err)
 	}
 	if restored.DeletedAt.Valid {
@@ -2114,7 +2114,7 @@ func TestAdminSettings_DeleteThenReupsertRestoresForcedRateList(t *testing.T) {
 	}
 
 	var restored mdb.Setting
-	if err := dao.Mdb.Unscoped().Where("`key` = ?", mdb.SettingKeyRateForcedRateList).Take(&restored).Error; err != nil {
+	if err := dao.Mdb.Unscoped().Where(map[string]any{"key": mdb.SettingKeyRateForcedRateList}).Take(&restored).Error; err != nil {
 		t.Fatalf("load restored forced rate list unscoped: %v", err)
 	}
 	if restored.DeletedAt.Valid {

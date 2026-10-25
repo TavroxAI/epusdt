@@ -79,9 +79,17 @@ func EnsureDefaultAdmin() (password string, created bool, err error) {
 	return password, created, nil
 }
 
+// settingKeyCond builds a dialect-safe "key = ?" condition. The hand-quoted
+// `key` form is MySQL-only; PostgreSQL renders it as a syntax error
+// (SQLSTATE 42601), which used to abort admin seeding entirely.
+func settingKeyCond(key string) map[string]any {
+	return map[string]any{"key": key}
+}
+
 func purgeDeletedInitialAdminPasswordPlainTx(tx *gorm.DB) error {
 	return tx.Unscoped().
-		Where("`key` = ? AND deleted_at IS NOT NULL", mdb.SettingKeyInitAdminPasswordPlain).
+		Where(settingKeyCond(mdb.SettingKeyInitAdminPasswordPlain)).
+		Where("deleted_at IS NOT NULL").
 		Delete(&mdb.Setting{}).Error
 }
 
@@ -163,7 +171,7 @@ func upsertSettingRow(tx *gorm.DB, row mdb.Setting) error {
 func GetInitialAdminPassword() (string, error) {
 	row := new(mdb.Setting)
 	if err := dao.Mdb.Model(&mdb.Setting{}).
-		Where("`key` = ?", mdb.SettingKeyInitAdminPasswordPlain).
+		Where(settingKeyCond(mdb.SettingKeyInitAdminPasswordPlain)).
 		Limit(1).
 		Find(row).Error; err != nil {
 		return "", err
@@ -174,7 +182,7 @@ func GetInitialAdminPassword() (string, error) {
 
 	var fetched mdb.Setting
 	if err := dao.Mdb.Model(&mdb.Setting{}).
-		Where("`key` = ?", mdb.SettingKeyInitAdminPasswordFetched).
+		Where(settingKeyCond(mdb.SettingKeyInitAdminPasswordFetched)).
 		Limit(1).
 		Find(&fetched).Error; err != nil {
 		return "", err
@@ -187,7 +195,7 @@ func GetInitialAdminPassword() (string, error) {
 
 func clearInitialAdminPasswordPlain(tx *gorm.DB) error {
 	res := tx.Unscoped().
-		Where("`key` = ?", mdb.SettingKeyInitAdminPasswordPlain).
+		Where(settingKeyCond(mdb.SettingKeyInitAdminPasswordPlain)).
 		Delete(&mdb.Setting{})
 	if res.Error != nil {
 		return res.Error
@@ -283,7 +291,7 @@ func UpdateAdminUserPassword(id uint64, newPlain string) error {
 
 		var plainRow mdb.Setting
 		if err := tx.Model(&mdb.Setting{}).
-			Where("`key` = ?", mdb.SettingKeyInitAdminPasswordPlain).
+			Where(settingKeyCond(mdb.SettingKeyInitAdminPasswordPlain)).
 			Limit(1).
 			Find(&plainRow).Error; err != nil {
 			return err
@@ -295,7 +303,7 @@ func UpdateAdminUserPassword(id uint64, newPlain string) error {
 		// clear any leftover plaintext if it exists.
 		var initHashRow mdb.Setting
 		if err := tx.Model(&mdb.Setting{}).
-			Where("`key` = ?", mdb.SettingKeyInitAdminPasswordHash).
+			Where(settingKeyCond(mdb.SettingKeyInitAdminPasswordHash)).
 			Limit(1).
 			Find(&initHashRow).Error; err != nil {
 			return err

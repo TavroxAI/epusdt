@@ -282,12 +282,17 @@ func GetOkPayAllowTokens() []string {
 
 // ListSettingsByGroup returns all rows for a given group (empty group = all),
 // excluding any keys in sensitiveSettingKeys.
+//
+// Conditions are expressed as column maps instead of hand-quoted SQL: the
+// backtick form (`key` / `group`) is MySQL-only and fails on PostgreSQL with
+// SQLSTATE 42601, while GORM quotes these columns with the active dialect's
+// quote character.
 func ListSettingsByGroup(group string) ([]mdb.Setting, error) {
 	var rows []mdb.Setting
-	tx := dao.Mdb.Model(&mdb.Setting{}).Not("`key`", sensitiveSettingKeys)
+	tx := dao.Mdb.Model(&mdb.Setting{}).Not(map[string]any{"key": sensitiveSettingKeys})
 	if group != "" {
-		tx = tx.Where("`group` = ?", group)
+		tx = tx.Where(map[string]any{"group": group})
 	}
-	err := tx.Order("`key` ASC").Find(&rows).Error
+	err := tx.Order(clause.OrderByColumn{Column: clause.Column{Name: "key"}}).Find(&rows).Error
 	return rows, err
 }

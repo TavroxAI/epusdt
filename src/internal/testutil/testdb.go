@@ -61,7 +61,7 @@ func SetupTestDatabases(t testing.TB) func() {
 			return ""
 		}
 		var row mdb.Setting
-		if err := dao.Mdb.Where("`key` = ?", key).Take(&row).Error; err != nil {
+		if err := dao.Mdb.Where(map[string]any{"key": key}).Take(&row).Error; err != nil {
 			return ""
 		}
 		return row.Value
