@@ -56,6 +56,15 @@ func MdbTableInit() {
 				// token list without the built-in coins and no line explained why.
 				// Keep going and report the failures once the seeds are done.
 				color.Red.Printf("[store_db] AutoMigrate DB(%s),err=%s\n", m.name, err)
+				// The error alone (e.g. pgx "insufficient arguments") does not say
+				// which statement failed, so replay this model once with SQL logging
+				// on: the failing statement then lands in the same journal.
+				color.Red.Printf("[store_db] replaying AutoMigrate DB(%s) with SQL logging to capture the failing statement\n", m.name)
+				if replayErr := Mdb.Debug().AutoMigrate(m.model); replayErr == nil {
+					// The replay fixed whatever was wrong; do not report it as failed.
+					color.Cyan.Printf("[store_db] AutoMigrate DB(%s) succeeded on replay\n", m.name)
+					continue
+				}
 				failed = append(failed, m.name)
 			}
 		}
