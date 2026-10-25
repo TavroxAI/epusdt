@@ -10,6 +10,7 @@ import (
 	"github.com/GMWalletApp/epusdt/config"
 	"github.com/GMWalletApp/epusdt/model/mdb"
 	"github.com/gookit/color"
+	"github.com/spf13/viper"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -85,7 +86,34 @@ func seedChains() {
 // ON CONFLICT DO NOTHING on the (network, symbol) unique index so
 // re-runs are no-ops and admin edits to contract_address / decimals /
 // min_amount persist across restarts.
+// countChainTokens prints how many chain token rows the connected database holds.
+// It also prints the driver and, for PostgreSQL, the target host and database
+// name, because "the seed ran but the coin is missing" is almost always the
+// process talking to another database than the operator inspects.
+func countChainTokens(label string) {
+	var count int64
+	if err := Mdb.Model(&mdb.ChainToken{}).Count(&count).Error; err != nil {
+		color.Red.Printf("%s: count err=%s\n", label, err)
+		return
+	}
+	target := Mdb.Dialector.Name()
+	if strings.EqualFold(target, "postgres") {
+		target = strings.Join([]string{
+			target,
+			"host=" + viper.GetString("postgres_host"),
+			"db=" + viper.GetString("postgres_database"),
+		}, " ")
+	}
+	color.Cyan.Printf("%s: %d rows (driver=%s)\n", label, count, target)
+}
 func seedChainTokens() {
+	// Print the target database and the row count around the seed. "The seed did
+	// nothing" has exactly three explanations (wrong database, silent conflict,
+	// insert error) and this line is what tells them apart from a journal without
+	// asking the operator to run SQL against production.
+	countChainTokens("[store_db] chain_tokens before seed")
+	defer countChainTokens("[store_db] chain_tokens after seed")
+
 	// Contract-address rows are matched by scanners via exact contract
 	// lookup. Native-token rows (empty contract_address) are matched by
 	// symbol — these act as admin toggles for the native payment path.
