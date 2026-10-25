@@ -4,6 +4,7 @@ import (
 	"context"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/GMWalletApp/epusdt/model/data"
@@ -191,7 +192,37 @@ func resolveChainHttpNode(network, logPrefix string, excludeIDs ...uint64) (mdb.
 	if err != nil {
 		log.Sugar.Errorf("%s resolve rpc_nodes err=%v", logPrefix, err)
 	} else {
-		log.Sugar.Warnf("%s no enabled %s HTTP RPC node configured in rpc_nodes", logPrefix, network)
+		warnMissingHttpNode(network, logPrefix)
 	}
 	return mdb.RpcNode{}, false
 }
+
+// warnMissingHttpNode reports a chain that has no general-purpose HTTP node.
+//
+// The EVM backfill scanner is the only safety net for transfer logs missed while
+// the websocket subscription is silent; without an HTTP node it stays idle and a
+// missed payment is never recovered. The message therefore names the consequence
+// and the fix instead of only stating the absence, and it is rate limited
+// because the resolver runs inside a retry loop.
+func warnMissingHttpNode(network, logPrefix string) {
+	const warnEvery = 5 * time.Minute
+
+	missingHttpNodeWarnMu.Lock()
+	lastWarn, warned := missingHttpNodeWarnAt[network]
+	now := time.Now()
+	if warned && now.Sub(lastWarn) < warnEvery {
+		missingHttpNodeWarnMu.Unlock()
+		return
+	}
+	missingHttpNodeWarnAt[network] = now
+	missingHttpNodeWarnMu.Unlock()
+
+	log.Sugar.Warnf("%s no enabled %s HTTP RPC node in rpc_nodes: the backfill scanner stays idle for this chain, "+
+		"so transfer logs missed during a websocket stall are never recovered. "+
+		"Add an HTTP node for %s with purpose=general.", logPrefix, network, network)
+}
+
+var (
+	missingHttpNodeWarnMu sync.Mutex
+	missingHttpNodeWarnAt = make(map[string]time.Time)
+)

@@ -12,6 +12,7 @@ require (
 	github.com/gookit/color v1.5.0
 	github.com/gookit/goutil v0.4.6
 	github.com/gookit/validate v1.3.1
+	github.com/gorilla/websocket v1.5.3
 	github.com/json-iterator/go v1.1.12
 	github.com/labstack/echo/v4 v4.6.0
 	github.com/libtnb/sqlite v1.0.1
@@ -61,7 +62,6 @@ require (
 	github.com/golang-jwt/jwt v3.2.2+incompatible // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gookit/filter v1.1.2 // indirect
-	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/holiman/uint256 v1.3.2 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect

@@ -2,6 +2,7 @@ package task
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -14,10 +15,33 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
-const (
-	evmStatsIdleInterval  = 30 * time.Second
-	evmStatsHeaderTimeout = 10 * time.Second
+const evmStatsHeaderTimeout = 10 * time.Second
+
+var (
+	// evmStatsIdleInterval is how long the listener waits with no activity before
+	// asking the node for its latest header. It doubles as the heartbeat probe.
+	evmStatsIdleInterval = 30 * time.Second
+
+	// evmWsStaleTimeout is how long a subscription may make no chain progress
+	// (no new block header AND no transfer log) before it is considered dead.
+	// Public websocket endpoints regularly stop pushing while the socket stays
+	// open, and the subscription error channel never fires in that case, so
+	// without this probe a chain silently stops detecting payments until the
+	// process is restarted. EVM blocks arrive within seconds, so three minutes
+	// without any new block is unambiguous.
+	evmWsStaleTimeout = 3 * time.Minute
+
+	// evmWsStaleMaxConsecutive is how many consecutive stalls are tolerated
+	// before the node is reported as failed (and a failover is attempted). A
+	// single stall is usually a transient endpoint hiccup; a node that keeps
+	// stalling is not usable and should not keep the only slot forever.
+	evmWsStaleMaxConsecutive = 3
 )
+
+// errEvmWsStale marks a reconnect that was triggered by the heartbeat probe
+// rather than by a visible connection error. Callers must not count it as a
+// node failure on the first occurrence.
+var errEvmWsStale = errors.New("evm websocket stalled")
 
 // runEvmWsLogListener connects to node.Url, subscribes to Transfer logs,
 // and dispatches each log to handleLog. It retries on transient errors
@@ -34,6 +58,7 @@ func runEvmWsLogListener(ctx context.Context, network string, logPrefix string, 
 	failWait := minBackoff
 	wsURL := node.Url
 	nodeLabel := data.RpcNodeLogLabel(node)
+	consecutiveStalls := 0
 
 	for {
 		if ctx.Err() != nil {
@@ -86,6 +111,25 @@ func runEvmWsLogListener(ctx context.Context, network string, logPrefix string, 
 		if ctx.Err() != nil {
 			return
 		}
+		if errors.Is(recvErr, errEvmWsStale) {
+			// A stalled subscription is not a connection error: the socket is still
+			// open and may simply resume. Only a node that keeps stalling is treated
+			// as failed, so a transient hiccup does not burn the failover slot.
+			consecutiveStalls++
+			log.Sugar.Warnf("%s subscription made no chain progress for %s, reconnecting (stall %d/%d), node=%s",
+				logPrefix, evmWsStaleTimeout, consecutiveStalls, evmWsStaleMaxConsecutive, nodeLabel)
+			if consecutiveStalls >= evmWsStaleMaxConsecutive {
+				consecutiveStalls = 0
+				if recordEvmNodeFailure(logPrefix, network, node, "stalled") {
+					return
+				}
+			}
+			if !sleepOrDone(ctx, rejoinWait) {
+				return
+			}
+			continue
+		}
+		consecutiveStalls = 0
 		if time.Since(connectedAt) >= stableResetAfter {
 			if recvErr != nil {
 				data.RecordRpcFailure(network)
@@ -103,8 +147,10 @@ func runEvmWsLogListener(ctx context.Context, network string, logPrefix string, 
 func recvLoop(ctx context.Context, client *ethclient.Client, sub ethereum.Subscription, logsCh <-chan types.Log, network string, logPrefix string, handleLog func(*ethclient.Client, types.Log)) error {
 	statsCtx, cancelStats := context.WithCancel(ctx)
 	statsTicker := time.NewTicker(evmStatsIdleInterval)
-	headerStatsDone := make(chan bool, 1)
+	headerStatsDone := make(chan evmHeaderProgress, 1)
 	lastStatsUpdateAt := time.Now()
+	lastProgressAt := time.Now()
+	lastBlockNumber := int64(0)
 	headerStatsInFlight := false
 	requestLatestHeader := func() {
 		if headerStatsInFlight {
@@ -129,13 +175,23 @@ func recvLoop(ctx context.Context, client *ethclient.Client, sub ethereum.Subscr
 			log.Sugar.Infof("%s context cancelled, stopping", logPrefix)
 			return nil
 		case <-statsTicker.C:
-			if shouldRefreshEvmLatestHeader(lastStatsUpdateAt, headerStatsInFlight, time.Now()) {
+			now := time.Now()
+			if evmWsStale(lastProgressAt, now, evmWsStaleTimeout) {
+				return errEvmWsStale
+			}
+			if shouldRefreshEvmLatestHeader(lastStatsUpdateAt, headerStatsInFlight, now) {
 				requestLatestHeader()
 			}
-		case updated := <-headerStatsDone:
+		case progress := <-headerStatsDone:
 			headerStatsInFlight = false
-			if updated {
+			if progress.ok {
 				lastStatsUpdateAt = time.Now()
+				// Only a *new* block counts as progress: an endpoint that answers
+				// with the same height over and over is not delivering the chain.
+				if progress.number > lastBlockNumber {
+					lastBlockNumber = progress.number
+					lastProgressAt = time.Now()
+				}
 			}
 		case err := <-sub.Err():
 			if err != nil {
@@ -153,9 +209,26 @@ func recvLoop(ctx context.Context, client *ethclient.Client, sub ethereum.Subscr
 			if recordEvmLogBlockHeight(network, logPrefix, vLog.BlockNumber) {
 				lastStatsUpdateAt = time.Now()
 			}
+			if vLog.BlockNumber > 0 {
+				lastProgressAt = time.Now()
+			}
 			handleLog(client, vLog)
 		}
 	}
+}
+
+// evmHeaderProgress is the result of one heartbeat probe.
+type evmHeaderProgress struct {
+	number int64
+	ok     bool
+}
+
+// evmWsStale reports whether a subscription has been silent for too long.
+func evmWsStale(lastProgressAt, now time.Time, timeout time.Duration) bool {
+	if timeout <= 0 {
+		return false
+	}
+	return now.Sub(lastProgressAt) >= timeout
 }
 
 func shouldRefreshEvmLatestHeader(lastStatsUpdateAt time.Time, inFlight bool, now time.Time) bool {
@@ -174,21 +247,24 @@ func recordEvmLogBlockHeight(network string, logPrefix string, blockNumber uint6
 	return true
 }
 
-func recordEvmLatestHeader(ctx context.Context, network string, logPrefix string, client *ethclient.Client) bool {
+func recordEvmLatestHeader(ctx context.Context, network string, logPrefix string, client *ethclient.Client) evmHeaderProgress {
 	headerCtx, cancel := context.WithTimeout(ctx, evmStatsHeaderTimeout)
 	defer cancel()
 
 	header, err := client.HeaderByNumber(headerCtx, nil)
 	if err != nil {
 		if ctx.Err() != nil {
-			return false
+			return evmHeaderProgress{}
 		}
 		data.RecordRpcFailure(network)
 		log.Sugar.Warnf("%s latest header stats failed: %v", logPrefix, err)
-		return false
+		return evmHeaderProgress{}
 	}
 	data.RecordRpcSuccess(network)
-	return recordEvmHeaderBlockHeight(network, logPrefix, header)
+	if !recordEvmHeaderBlockHeight(network, logPrefix, header) {
+		return evmHeaderProgress{}
+	}
+	return evmHeaderProgress{number: header.Number.Int64(), ok: true}
 }
 
 func recordEvmHeaderBlockHeight(network string, logPrefix string, header *types.Header) bool {

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/GMWalletApp/epusdt/util/sign"
 	"github.com/spf13/viper"
 )
 
@@ -31,7 +33,19 @@ var (
 	BuildDate          = "unknown"
 	configRootPath     string
 	explicitConfigPath string
+
+	// GMPay signing material. The Ed25519 private key is the only trust root
+	// for notify / by-order-id snapshot / create-order responses; the reconcile
+	// key only authenticates outbound lookups. Both are mandatory outside the
+	// install wizard: a missing key must abort startup instead of silently
+	// degrading to unauthenticated responses.
+	gmpaySigningKey   ed25519.PrivateKey
+	gmpayReconcileKey string
 )
+
+// minGMPayReconcileKeyLength is the shortest accepted reconcile secret. A
+// short key is as good as no key: the endpoint it guards reads any order.
+const minGMPayReconcileKeyLength = 32
 
 func SetConfigPath(path string) {
 	explicitConfigPath = strings.TrimSpace(path)
@@ -69,6 +83,47 @@ func Init() {
 	TgBotToken = viper.GetString("tg_bot_token")
 	TgProxy = viper.GetString("tg_proxy")
 	TgManage = viper.GetInt64("tg_manage")
+	loadGMPayKeys()
+}
+
+// loadGMPayKeys validates and stores the GMPay signing material read from the
+// config file. It panics on a missing or malformed value: startup failing loudly
+// is the only safe behavior, because the alternative is serving unsigned
+// responses or an unauthenticated order lookup.
+func loadGMPayKeys() {
+	if strings.EqualFold(strings.TrimSpace(viper.GetString("install")), "true") {
+		// The wizard still owns the config file during a (re)install; it cannot
+		// generate these keys. Every normal startup path is fail-closed.
+		return
+	}
+	signingKey, err := sign.PrivateKeyFromSeedHex(viper.GetString("gmpay_signing_key"))
+	if err != nil {
+		panic(fmt.Sprintf("gmpay_signing_key is required: %s (expected the 64 hex character Ed25519 seed; see .env.example)", err.Error()))
+	}
+	reconcileKey := strings.TrimSpace(viper.GetString("gmpay_reconcile_key"))
+	if len(reconcileKey) < minGMPayReconcileKeyLength {
+		panic(fmt.Sprintf("gmpay_reconcile_key is required and must be at least %d characters", minGMPayReconcileKeyLength))
+	}
+	gmpaySigningKey = signingKey
+	gmpayReconcileKey = reconcileKey
+}
+
+// GetGMPaySigningKey returns the configured Ed25519 private key.
+func GetGMPaySigningKey() (ed25519.PrivateKey, error) {
+	if len(gmpaySigningKey) != ed25519.PrivateKeySize {
+		return nil, errors.New("gmpay_signing_key is not loaded")
+	}
+	return gmpaySigningKey, nil
+}
+
+// GetGMPayReconcileKey returns the reconcile key used to authenticate
+// by-order-id lookups. Callers must reject the request when it is empty: the
+// endpoint it guards would otherwise be unauthenticated.
+func GetGMPayReconcileKey() (string, error) {
+	if strings.TrimSpace(gmpayReconcileKey) == "" {
+		return "", errors.New("gmpay_reconcile_key is not configured")
+	}
+	return gmpayReconcileKey, nil
 }
 
 func mustMkdir(path string) {

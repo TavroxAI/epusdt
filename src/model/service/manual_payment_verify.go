@@ -183,7 +183,11 @@ func validateManualEvmPayment(order *mdb.Orders, txID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if token == nil || token.ID == 0 || strings.TrimSpace(token.ContractAddress) == "" {
+	if token == nil || token.ID == 0 {
+		return "", fmt.Errorf("enabled token not configured for %s/%s", order.Network, order.Token)
+	}
+	native := strings.TrimSpace(token.ContractAddress) == ""
+	if native && !IsEvmNativeToken(*token) {
 		return "", fmt.Errorf("enabled token contract not configured for %s/%s", order.Network, order.Token)
 	}
 
@@ -196,7 +200,12 @@ func validateManualEvmPayment(order *mdb.Orders, txID string) (string, error) {
 	}
 	defer closeManualEvmClients(clients)
 
-	if err = validateManualEvmPaymentAcrossClients(ctx, clients, order, txHash, token); err != nil {
+	if native {
+		err = validateManualEvmNativePaymentAcrossClients(ctx, clients, order, txHash, token)
+	} else {
+		err = validateManualEvmPaymentAcrossClients(ctx, clients, order, txHash, token)
+	}
+	if err != nil {
 		return "", err
 	}
 	return canonicalTxID, nil
@@ -204,6 +213,7 @@ func validateManualEvmPayment(order *mdb.Orders, txID string) (string, error) {
 
 type evmChainReader interface {
 	TransactionReceipt(context.Context, common.Hash) (*types.Receipt, error)
+	TransactionByHash(context.Context, common.Hash) (*types.Transaction, bool, error)
 	HeaderByNumber(context.Context, *big.Int) (*types.Header, error)
 }
 
@@ -237,24 +247,8 @@ func validateManualEvmPaymentAcrossClients(ctx context.Context, clients []manual
 }
 
 func validateManualEvmPaymentWithClient(ctx context.Context, client evmChainReader, order *mdb.Orders, txHash common.Hash, token *mdb.ChainToken) error {
-	receipt, err := client.TransactionReceipt(ctx, txHash)
+	receipt, err := validateEvmReceiptWindow(ctx, client, order, txHash)
 	if err != nil {
-		return fmt.Errorf("fetch transaction receipt: %w", err)
-	}
-	if receipt.Status != types.ReceiptStatusSuccessful {
-		return fmt.Errorf("transaction is not successful")
-	}
-	if receipt.BlockNumber == nil {
-		return fmt.Errorf("transaction receipt missing block number")
-	}
-	txHeader, err := client.HeaderByNumber(ctx, receipt.BlockNumber)
-	if err != nil {
-		return fmt.Errorf("fetch transaction block header: %w", err)
-	}
-	if err = ensureEvmTransactionNotBeforeOrder(txHeader.Time, order); err != nil {
-		return err
-	}
-	if err = ensureEvmConfirmations(ctx, client, order.Network, receipt.BlockNumber); err != nil {
 		return err
 	}
 
@@ -288,6 +282,75 @@ func validateManualEvmPaymentWithClient(ctx context.Context, client evmChainRead
 		return fmt.Errorf("transaction amount mismatch")
 	}
 	return fmt.Errorf("matching token transfer to order address not found")
+}
+
+// validateManualEvmNativePaymentWithClient verifies a native coin (ETH/BNB)
+// payment: the transfer carries no logs, so the value and recipient of the
+// transaction itself are the evidence.
+func validateManualEvmNativePaymentWithClient(ctx context.Context, client evmChainReader, order *mdb.Orders, txHash common.Hash, token *mdb.ChainToken) error {
+	if _, err := validateEvmReceiptWindow(ctx, client, order, txHash); err != nil {
+		return err
+	}
+
+	to, err := normalizeEvmAddress(order.ReceiveAddress)
+	if err != nil {
+		return fmt.Errorf("invalid order receive address: %w", err)
+	}
+	tx, _, err := client.TransactionByHash(ctx, txHash)
+	if err != nil {
+		return fmt.Errorf("fetch transaction: %w", err)
+	}
+	if tx == nil {
+		return fmt.Errorf("transaction not found")
+	}
+	if tx.To() == nil || !strings.EqualFold(tx.To().Hex(), to.Hex()) {
+		return fmt.Errorf("transaction recipient is not the order address")
+	}
+	if !amountMatchesRaw(order.ActualAmount, tx.Value(), token.Decimals) {
+		return fmt.Errorf("transaction amount mismatch")
+	}
+	return nil
+}
+
+func validateManualEvmNativePaymentAcrossClients(ctx context.Context, clients []manualEvmClient, order *mdb.Orders, txHash common.Hash, token *mdb.ChainToken) error {
+	var verifyErrors []string
+	for _, item := range clients {
+		if err := validateManualEvmNativePaymentWithClient(ctx, item.reader, order, txHash, token); err != nil {
+			verifyErrors = append(verifyErrors, fmt.Sprintf("%s: %v", item.label, err))
+			continue
+		}
+		return nil
+	}
+	if len(verifyErrors) > 0 {
+		return fmt.Errorf("manual EVM verification failed: %s", strings.Join(verifyErrors, "; "))
+	}
+	return fmt.Errorf("manual EVM verification unavailable")
+}
+
+// validateEvmReceiptWindow checks the shared receipt preconditions: the transfer
+// succeeded, its block is not older than the order, and it is deep enough.
+func validateEvmReceiptWindow(ctx context.Context, client evmChainReader, order *mdb.Orders, txHash common.Hash) (*types.Receipt, error) {
+	receipt, err := client.TransactionReceipt(ctx, txHash)
+	if err != nil {
+		return nil, fmt.Errorf("fetch transaction receipt: %w", err)
+	}
+	if receipt.Status != types.ReceiptStatusSuccessful {
+		return nil, fmt.Errorf("transaction is not successful")
+	}
+	if receipt.BlockNumber == nil {
+		return nil, fmt.Errorf("transaction receipt missing block number")
+	}
+	txHeader, err := client.HeaderByNumber(ctx, receipt.BlockNumber)
+	if err != nil {
+		return nil, fmt.Errorf("fetch transaction block header: %w", err)
+	}
+	if err = ensureEvmTransactionNotBeforeOrder(txHeader.Time, order); err != nil {
+		return nil, err
+	}
+	if err = ensureEvmConfirmations(ctx, client, order.Network, receipt.BlockNumber); err != nil {
+		return nil, err
+	}
+	return receipt, nil
 }
 
 func dialManualEvmClients(ctx context.Context, network string) ([]manualEvmClient, error) {

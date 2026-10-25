@@ -1,11 +1,21 @@
 package service
 
 import (
+	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"math/big"
 	"net/http"
+	"os"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +27,7 @@ import (
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
 	"github.com/GMWalletApp/epusdt/model/request"
+	"github.com/GMWalletApp/epusdt/model/response"
 	"github.com/GMWalletApp/epusdt/util/constant"
 	"github.com/GMWalletApp/epusdt/util/http_client"
 	"github.com/go-resty/resty/v2"
@@ -1632,5 +1643,266 @@ func TestOrderProcessingSubOrderExpiresSiblingsAndReleasesLocks(t *testing.T) {
 	}
 	if ethLock != "" {
 		t.Fatalf("eth sub-order runtime lock still held: trade_id=%s", ethLock)
+	}
+}
+
+// orderSignTestSeed is the fixture seed of the Ed25519 key pair the service
+// signs create-order responses with. TestMain writes it into a throwaway config
+// file and runs config.Init, so the tests exercise the same fail-closed key
+// loading production uses instead of a test-only shortcut.
+const orderSignTestSeed = "epusdt-order-sign-test-seed"
+
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "epusdt-order-sign-config")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create signing config dir: %v\n", err)
+		os.Exit(1)
+	}
+	seed := sha256.Sum256([]byte(orderSignTestSeed))
+	configPath := filepath.Join(dir, ".env")
+	content := fmt.Sprintf("gmpay_signing_key=%s\ngmpay_reconcile_key=%s\n",
+		hex.EncodeToString(seed[:]), strings.Repeat("r", 32))
+	if err = os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "write signing config: %v\n", err)
+		os.Exit(1)
+	}
+	config.SetConfigPath(configPath)
+	config.Init()
+
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
+
+// orderSignTestPublicKey recomputes the public half from the fixture seed
+// instead of asking the code under test, so a wrong configured key cannot make
+// a signature assertion pass.
+func orderSignTestPublicKey(t *testing.T) ed25519.PublicKey {
+	t.Helper()
+	seed := sha256.Sum256([]byte(orderSignTestSeed))
+	priv := ed25519.NewKeyFromSeed(seed[:])
+	pub, ok := priv.Public().(ed25519.PublicKey)
+	if !ok {
+		t.Fatal("signing fixture key has no ed25519 public half")
+	}
+	return pub
+}
+
+// orderResponseParamsForTest decodes the response the way a merchant receives
+// it: the struct is serialized with the standard library (the encoder echo
+// uses) and read back as a generic JSON object.
+func orderResponseParamsForTest(t *testing.T, resp *response.CreateTransactionResponse) map[string]interface{} {
+	t.Helper()
+	wire, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal create-order response: %v", err)
+	}
+	params := make(map[string]interface{})
+	if err = json.Unmarshal(wire, &params); err != nil {
+		t.Fatalf("decode create-order response: %v", err)
+	}
+	return params
+}
+
+// canonicalForTest reimplements the documented canonical rules instead of
+// calling util/sign: the expectation has to come from the contract, otherwise a
+// canonical change would move signer and test together while merchants break.
+func canonicalForTest(t *testing.T, params map[string]interface{}) string {
+	t.Helper()
+	pairs := make([]string, 0, len(params))
+	for key, value := range params {
+		if key == "signature" || value == nil {
+			continue
+		}
+		var text string
+		switch typed := value.(type) {
+		case string:
+			text = typed
+		case bool:
+			text = strconv.FormatBool(typed)
+		case float64:
+			text = strconv.FormatFloat(typed, 'f', -1, 64)
+		default:
+			t.Fatalf("canonical form has no rule for %T (%q)", value, key)
+		}
+		if text == "" {
+			continue
+		}
+		pairs = append(pairs, key+"="+text)
+	}
+	sort.Strings(pairs)
+	return strings.Join(pairs, "&")
+}
+
+func verifyOrderResponseForTest(t *testing.T, params map[string]interface{}, pub ed25519.PublicKey) bool {
+	t.Helper()
+	signature, ok := params["signature"].(string)
+	if !ok {
+		t.Fatal("response has no signature field")
+	}
+	raw, err := hex.DecodeString(signature)
+	if err != nil {
+		t.Fatalf("signature is not hex: %v", err)
+	}
+	if len(raw) != ed25519.SignatureSize {
+		t.Fatalf("signature is %d bytes, want %d", len(raw), ed25519.SignatureSize)
+	}
+	return ed25519.Verify(pub, []byte(canonicalForTest(t, params)), raw)
+}
+
+func TestCreateTransactionResponseIsSigned(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+	if _, err := data.AddWalletAddress("wallet_sign_1"); err != nil {
+		t.Fatalf("add wallet: %v", err)
+	}
+
+	resp, err := CreateTransaction(newCreateTransactionRequest("order_sign_1", 12.34), nil)
+	if err != nil {
+		t.Fatalf("create transaction: %v", err)
+	}
+	pub := orderSignTestPublicKey(t)
+	if resp.SignType != "ed25519" {
+		t.Fatalf("sign_type = %q, want ed25519", resp.SignType)
+	}
+	wantKeyID := hex.EncodeToString(pub)[:8]
+	if resp.KeyId != wantKeyID {
+		t.Fatalf("key_id = %q, want %q (first 8 hex characters of the signing public key)", resp.KeyId, wantKeyID)
+	}
+
+	params := orderResponseParamsForTest(t, resp)
+	if !verifyOrderResponseForTest(t, params, pub) {
+		t.Fatalf("signed create response does not verify; canonical = %s", canonicalForTest(t, params))
+	}
+	// The settlement inputs new-api re-checks must be inside the signed bytes.
+	// Whole "k=v" pairs are compared so actual_amount cannot satisfy the amount
+	// assertion by substring.
+	canonical := canonicalForTest(t, params)
+	canonicalPairs := strings.Split(canonical, "&")
+	wantPaymentURL := config.GetAppUri() + "/pay/checkout-counter/" + resp.TradeId
+	for _, pair := range []string{
+		"trade_id=" + resp.TradeId,
+		"order_id=order_sign_1",
+		"amount=12.34",
+		"currency=CNY",
+		"payment_url=" + wantPaymentURL,
+		"sign_type=ed25519",
+		"key_id=" + wantKeyID,
+	} {
+		if !slices.Contains(canonicalPairs, pair) {
+			t.Fatalf("canonical form is missing the pair %q: %s", pair, canonical)
+		}
+	}
+	for _, pair := range canonicalPairs {
+		if strings.HasPrefix(pair, "signature=") {
+			t.Fatalf("signature must not participate in its own canonical form: %s", canonical)
+		}
+	}
+
+	// Placeholder orders (status=4, no token/network) are signed as well: empty
+	// strings must be skipped by both sides, and numerics such as
+	// actual_amount=0 must still participate.
+	placeholder := newCreateTransactionRequest("order_sign_placeholder_1", 3)
+	placeholder.Token = ""
+	placeholder.Network = ""
+	placeholderResp, err := CreateTransaction(placeholder, nil)
+	if err != nil {
+		t.Fatalf("create placeholder transaction: %v", err)
+	}
+	placeholderParams := orderResponseParamsForTest(t, placeholderResp)
+	if !verifyOrderResponseForTest(t, placeholderParams, pub) {
+		t.Fatalf("placeholder response does not verify; canonical = %s", canonicalForTest(t, placeholderParams))
+	}
+	placeholderCanonical := canonicalForTest(t, placeholderParams)
+	placeholderPairs := strings.Split(placeholderCanonical, "&")
+	for _, pair := range placeholderPairs {
+		if strings.HasPrefix(pair, "token=") || strings.HasPrefix(pair, "receive_address=") {
+			t.Fatalf("empty placeholder fields must not enter the canonical form: %s", placeholderCanonical)
+		}
+	}
+	if !slices.Contains(placeholderPairs, "actual_amount=0") {
+		t.Fatalf("numeric zero must participate in the canonical form: %s", placeholderCanonical)
+	}
+}
+
+func TestCreateTransactionResponseSignatureCoversSettlementFields(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+	if _, err := data.AddWalletAddress("wallet_sign_tamper"); err != nil {
+		t.Fatalf("add wallet: %v", err)
+	}
+
+	resp, err := CreateTransaction(newCreateTransactionRequest("order_sign_tamper_1", 5), nil)
+	if err != nil {
+		t.Fatalf("create transaction: %v", err)
+	}
+	pub := orderSignTestPublicKey(t)
+	params := orderResponseParamsForTest(t, resp)
+	if !verifyOrderResponseForTest(t, params, pub) {
+		t.Fatal("freshly created response does not verify")
+	}
+
+	tamper := map[string]func(state map[string]interface{}){
+		"payment_url": func(state map[string]interface{}) {
+			state["payment_url"] = "https://attacker.example.com/pay/checkout-counter/" + resp.TradeId
+		},
+		"amount": func(state map[string]interface{}) {
+			state["amount"] = state["amount"].(float64) + 1
+		},
+		"currency": func(state map[string]interface{}) {
+			state["currency"] = "USD"
+		},
+		"order_id": func(state map[string]interface{}) {
+			state["order_id"] = "order_sign_tamper_2"
+		},
+	}
+	for field, mutate := range tamper {
+		t.Run(field, func(t *testing.T) {
+			changed := maps.Clone(params)
+			mutate(changed)
+			if verifyOrderResponseForTest(t, changed, pub) {
+				t.Fatalf("rewriting %q after signing must break verification", field)
+			}
+		})
+	}
+}
+
+func TestCreateTransactionFailureReturnsNoSignature(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+	if _, err := data.AddWalletAddress("wallet_sign_failure"); err != nil {
+		t.Fatalf("add wallet: %v", err)
+	}
+
+	created, err := CreateTransaction(newCreateTransactionRequest("order_sign_failure_1", 1), nil)
+	if err != nil {
+		t.Fatalf("create transaction: %v", err)
+	}
+	if created.Signature == "" {
+		t.Fatal("a successful create must carry a signature")
+	}
+
+	// Replaying the same order_id keeps the existing business code and returns
+	// no response at all, so a merchant never sees a signature on an error.
+	duplicate, err := CreateTransaction(newCreateTransactionRequest("order_sign_failure_1", 1), nil)
+	if err == nil {
+		t.Fatal("duplicate order_id must fail")
+	}
+	if code, _ := constant.ResolveErrno(err); code != 10002 {
+		t.Fatalf("duplicate order_id code = %d, want 10002", code)
+	}
+	if duplicate != nil {
+		t.Fatalf("failed create returned a response (signature %q)", duplicate.Signature)
+	}
+
+	// A validation failure keeps its code as well and is equally unsigned.
+	invalid := newCreateTransactionRequest("order_sign_failure_2", 1)
+	invalid.NotifyUrl = "http://127.0.0.1/notify"
+	failed, err := CreateTransaction(invalid, nil)
+	if code, _ := constant.ResolveErrno(err); code != 10041 {
+		t.Fatalf("invalid notify url code = %d, want 10041", code)
+	}
+	if failed != nil {
+		t.Fatalf("failed create returned a response (signature %q)", failed.Signature)
 	}
 }

@@ -82,6 +82,10 @@ func RegisterRoute(e *echo.Echo) {
 	gmpayV1 := paymentRoute.Group("/gmpay/v1")
 	gmpayV1.POST("/order/create-transaction", comm.Ctrl.CreateTransaction, middleware.CheckApiSign())
 	gmpayV1.GET("/config", comm.Ctrl.GetPublicConfig)
+	// Reconciliation lookup: same group as create-transaction, but authorized by
+	// the static .env reconcile key instead of a merchant api_keys row, so it
+	// uses CheckReconcileSign rather than CheckApiSign.
+	gmpayV1.GET("/orders/by-order-id/:order_id", comm.Ctrl.GetOrderByOrderId, middleware.CheckReconcileSign())
 
 	// okpay v1 routes
 	okpayV1 := paymentRoute.Group("/okpay/v1")

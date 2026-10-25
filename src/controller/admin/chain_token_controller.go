@@ -6,6 +6,7 @@ import (
 
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
+	"github.com/GMWalletApp/epusdt/model/service"
 	"github.com/GMWalletApp/epusdt/util/constant"
 	"github.com/labstack/echo/v4"
 )
@@ -44,6 +45,16 @@ func validateChainTokenPaymentConfig(row *mdb.ChainToken) error {
 	contractAddress := strings.TrimSpace(row.ContractAddress)
 	if row.Enabled && row.Network == mdb.NetworkAptos && contractAddress == "" {
 		return constant.ParamsMarshalErr
+	}
+	// EVM chains scan ERC20/BEP20 Transfer logs plus one native coin from block
+	// transactions (ETH on ethereum, BNB on binance). A row without a contract is
+	// only meaningful for that canonical native symbol; anything else would be a
+	// payment method the scanners never report.
+	switch strings.ToLower(strings.TrimSpace(row.Network)) {
+	case mdb.NetworkEthereum, mdb.NetworkBsc, mdb.NetworkPolygon, mdb.NetworkPlasma:
+		if row.Enabled && contractAddress == "" && !service.IsEvmNativeToken(*row) {
+			return constant.EvmNativeTokenErr
+		}
 	}
 	return nil
 }

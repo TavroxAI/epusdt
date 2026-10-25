@@ -1,15 +1,24 @@
 package mq
 
 import (
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/GMWalletApp/epusdt/config"
 	"github.com/GMWalletApp/epusdt/internal/testutil"
 	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/data"
@@ -157,8 +166,7 @@ func TestProcessExpiredOrdersKeepsPaidOrdersPaid(t *testing.T) {
 }
 
 func TestDispatchPendingCallbacksHonorsBackoffAndPersistsSuccess(t *testing.T) {
-	cleanup := testutil.SetupTestDatabases(t)
-	defer cleanup()
+	setupGMPayCallbackTest(t)
 
 	callbackLimiter = make(chan struct{}, 1)
 	callbackInflight = sync.Map{}
@@ -214,8 +222,7 @@ func TestDispatchPendingCallbacksHonorsBackoffAndPersistsSuccess(t *testing.T) {
 }
 
 func TestDispatchPendingCallbacksResumesRetryAfterRestart(t *testing.T) {
-	cleanup := testutil.SetupTestDatabases(t)
-	defer cleanup()
+	setupGMPayCallbackTest(t)
 
 	callbackLimiter = make(chan struct{}, 1)
 	callbackInflight = sync.Map{}
@@ -439,50 +446,41 @@ func TestResolveOrderApiKeyReturnsEnabledRow(t *testing.T) {
 	}
 }
 
-func TestSendOrderCallbackGmpayUsesApiKeySecretByPid(t *testing.T) {
-	cleanup := testutil.SetupTestDatabases(t)
-	defer cleanup()
+func TestSendOrderCallbackGmpayNotifyIsEd25519Signed(t *testing.T) {
+	priv := setupGMPayCallbackTest(t)
+	pub := priv.Public().(ed25519.PublicKey)
 
 	key := &mdb.ApiKey{
-		Name:      "gmpay-key",
+		Name:      "gmpay-ed25519-key",
 		Pid:       "9001",
-		SecretKey: "gmpay-secret-9001",
+		SecretKey: "hmac-secret-must-not-sign-callbacks",
 		Status:    mdb.ApiKeyStatusEnable,
 	}
 	if err := dao.Mdb.Create(key).Error; err != nil {
 		t.Fatalf("create gmpay api key: %v", err)
 	}
 
-	warningKey := &mdb.ApiKey{
-		Name:      "wrong-key",
-		Pid:       "9002",
-		SecretKey: "wrong-secret-9002",
-		Status:    mdb.ApiKeyStatusEnable,
-	}
-	if err := dao.Mdb.Create(warningKey).Error; err != nil {
-		t.Fatalf("create wrong api key: %v", err)
-	}
-
-	var received map[string]interface{}
+	var method, contentType string
+	var body []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
-		body, _ := io.ReadAll(r.Body)
-		_ = json.Unmarshal(body, &received)
+		method = r.Method
+		contentType = r.Header.Get("Content-Type")
+		body, _ = io.ReadAll(r.Body)
 		_, _ = io.WriteString(w, "ok")
 	}))
 	defer server.Close()
 
 	order := &mdb.Orders{
-		TradeId:            "trade_gmpay_sign",
-		OrderId:            "order_gmpay_sign",
-		Amount:             1,
+		TradeId:            "trade_gmpay_ed25519",
+		OrderId:            "order_gmpay_ed25519",
+		Amount:             100,
 		Currency:           "CNY",
-		ActualAmount:       1,
-		ReceiveAddress:     "wallet_gmpay",
+		ActualAmount:       14.2857,
+		ReceiveAddress:     "wallet_gmpay_ed25519",
 		Token:              "USDT",
 		Status:             mdb.StatusPaySuccess,
 		NotifyUrl:          server.URL,
-		BlockTransactionId: "block_gmpay_sign",
+		BlockTransactionId: "block_gmpay_ed25519",
 		ApiKeyID:           key.ID,
 		PaymentType:        mdb.PaymentTypeGmpay,
 	}
@@ -491,37 +489,155 @@ func TestSendOrderCallbackGmpayUsesApiKeySecretByPid(t *testing.T) {
 		t.Fatalf("send callback: %v", err)
 	}
 
-	if received == nil {
-		t.Fatal("expected callback payload")
+	if method != http.MethodPost {
+		t.Fatalf("callback method = %s, want %s", method, http.MethodPost)
 	}
-	if gotPid, _ := received["pid"].(string); gotPid != key.Pid {
-		t.Fatalf("payload pid = %q, want %q", gotPid, key.Pid)
+	if contentType != "application/json" {
+		t.Fatalf("callback content type = %q, want application/json", contentType)
 	}
-	if _, ok := received["payment_type"]; ok {
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode callback body %q: %v", body, err)
+	}
+
+	// A successful payment still reports the business fields the merchant needs.
+	if got, _ := payload["pid"].(string); got != key.Pid {
+		t.Fatalf("payload pid = %q, want %q", got, key.Pid)
+	}
+	if got, _ := payload["trade_id"].(string); got != order.TradeId {
+		t.Fatalf("payload trade_id = %q, want %q", got, order.TradeId)
+	}
+	if got, _ := payload["order_id"].(string); got != order.OrderId {
+		t.Fatalf("payload order_id = %q, want %q", got, order.OrderId)
+	}
+	if got, _ := payload["amount"].(float64); got != order.Amount {
+		t.Fatalf("payload amount = %v, want %v", got, order.Amount)
+	}
+	if got, _ := payload["actual_amount"].(float64); got != order.ActualAmount {
+		t.Fatalf("payload actual_amount = %v, want %v", got, order.ActualAmount)
+	}
+	if got, _ := payload["receive_address"].(string); got != order.ReceiveAddress {
+		t.Fatalf("payload receive_address = %q, want %q", got, order.ReceiveAddress)
+	}
+	if got, _ := payload["token"].(string); got != order.Token {
+		t.Fatalf("payload token = %q, want %q", got, order.Token)
+	}
+	if got, _ := payload["block_transaction_id"].(string); got != order.BlockTransactionId {
+		t.Fatalf("payload block_transaction_id = %q, want %q", got, order.BlockTransactionId)
+	}
+	if got, _ := payload["status"].(float64); got != float64(mdb.StatusPaySuccess) {
+		t.Fatalf("payload status = %v, want %d", got, mdb.StatusPaySuccess)
+	}
+	if _, ok := payload["payment_type"]; ok {
 		t.Fatal("GMPay callback payload must not include payment_type")
 	}
 
-	recvSig, _ := received["signature"].(string)
-	if recvSig == "" {
+	// sign_type and key_id are part of the signed payload.
+	if got, _ := payload["sign_type"].(string); got != "ed25519" {
+		t.Fatalf("payload sign_type = %q, want ed25519", got)
+	}
+	wantKeyID := hex.EncodeToString(pub)[:8]
+	if got, _ := payload["key_id"].(string); got != wantKeyID {
+		t.Fatalf("payload key_id = %q, want %q", got, wantKeyID)
+	}
+
+	// Verify the bytes the sender actually handed to the HTTP client. The
+	// canonical form is recomputed here from the wire bytes with an independent
+	// implementation of the protocol rules.
+	signatureHex, _ := payload["signature"].(string)
+	if signatureHex == "" {
 		t.Fatal("payload signature is empty")
 	}
-	delete(received, "signature")
-
-	calcSig, err := sign.GetHMACSHA256(received, key.SecretKey)
+	signature, err := hex.DecodeString(signatureHex)
 	if err != nil {
-		t.Fatalf("calc signature with target secret: %v", err)
+		t.Fatalf("payload signature is not hex: %v", err)
 	}
-	if recvSig != calcSig {
-		t.Fatalf("signature mismatch: got %q want %q", recvSig, calcSig)
+	if !ed25519.Verify(pub, []byte(canonicalNotifyParams(t, payload)), signature) {
+		t.Fatalf("wire bytes do not carry a valid Ed25519 signature: %s", body)
 	}
 
-	wrongSig, err := sign.GetHMACSHA256(received, warningKey.SecretKey)
+	// Every signed field must be covered: changing one and keeping the signature
+	// must break verification.
+	for _, tamper := range []struct {
+		field string
+		apply func(map[string]interface{})
+	}{
+		{"sign_type", func(p map[string]interface{}) { p["sign_type"] = "hmac" }},
+		{"key_id", func(p map[string]interface{}) { p["key_id"] = "00000000" }},
+		{"amount", func(p map[string]interface{}) { p["amount"] = 999999.0 }},
+		{"order_id", func(p map[string]interface{}) { p["order_id"] = "tampered-order-id" }},
+	} {
+		t.Run("tampered "+tamper.field, func(t *testing.T) {
+			tampered := maps.Clone(payload)
+			tamper.apply(tampered)
+			if ed25519.Verify(pub, []byte(canonicalNotifyParams(t, tampered)), signature) {
+				t.Fatalf("signature still verifies after changing %s", tamper.field)
+			}
+		})
+	}
+}
+
+// setupGMPayCallbackTest prepares the test databases and loads a fixed Ed25519
+// seed as the GMPay signing key through config.Init(), the same path production
+// uses. Callbacks sign with the configured key, so without it the worker refuses
+// to send anything.
+func setupGMPayCallbackTest(t *testing.T) ed25519.PrivateKey {
+	t.Helper()
+
+	cleanup := testutil.SetupTestDatabases(t)
+	t.Cleanup(cleanup)
+
+	const seed = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+	priv, err := sign.PrivateKeyFromSeedHex(seed)
 	if err != nil {
-		t.Fatalf("calc signature with wrong secret: %v", err)
+		t.Fatalf("derive test signing key: %v", err)
 	}
-	if recvSig == wrongSig {
-		t.Fatal("signature should not match wrong api key secret")
+
+	envPath := filepath.Join(t.TempDir(), ".env")
+	env := strings.Join([]string{
+		"log_level=error",
+		"gmpay_signing_key=" + seed,
+		"gmpay_reconcile_key=reconcile-test-key-0123456789abcdef",
+	}, "\n")
+	if err = os.WriteFile(envPath, []byte(env), 0o600); err != nil {
+		t.Fatalf("write test config: %v", err)
 	}
+	config.SetConfigPath(envPath)
+	t.Cleanup(func() { config.SetConfigPath("") })
+	config.Init()
+
+	return priv
+}
+
+// canonicalNotifyParams reimplements the wire canonicalisation instead of
+// calling util/sign, so the assertion does not share the implementation under
+// test: drop signature/nil/empty strings, render float64 with FormatFloat,
+// sort the k=v pairs and join them with "&".
+func canonicalNotifyParams(t *testing.T, payload map[string]interface{}) string {
+	t.Helper()
+
+	parts := make([]string, 0, len(payload))
+	for key, value := range payload {
+		if key == "signature" || value == nil {
+			continue
+		}
+		switch v := value.(type) {
+		case string:
+			if v == "" {
+				continue
+			}
+			parts = append(parts, key+"="+v)
+		case float64:
+			parts = append(parts, key+"="+strconv.FormatFloat(v, 'f', -1, 64))
+		case bool:
+			parts = append(parts, key+"="+strconv.FormatBool(v))
+		default:
+			t.Fatalf("unexpected callback payload type %T for %q", value, key)
+		}
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "&")
 }
 
 func TestSendOrderCallbackEpayUsesApiKeySecretByPid(t *testing.T) {

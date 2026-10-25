@@ -23,9 +23,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -270,15 +272,19 @@ func RunInstallServer(listenAddr, envFilePath string) {
 // formControlledKeys are keys whose values always come from the install form
 // (or are set unconditionally by the template). Existing config values for
 // these keys must NOT be preserved — the form submission takes precedence.
+//
+// order_expiration_time and order_notice_max_retry are deliberately absent: an
+// operator who tuned them in .env keeps the tuned value across a re-install
+// (the template still renders both, so the non-empty old value is substituted).
+// writeEnvFile warns when the submitted form value differs from the value it
+// keeps, so the form is never ignored silently.
 var formControlledKeys = map[string]bool{
-	"app_name":               true,
-	"app_uri":                true,
-	"http_listen":            true,
-	"runtime_root_path":      true,
-	"log_save_path":          true,
-	"order_expiration_time":  true,
-	"order_notice_max_retry": true,
-	"install":                true,
+	"app_name":          true,
+	"app_uri":           true,
+	"http_listen":       true,
+	"runtime_root_path": true,
+	"log_save_path":     true,
+	"install":           true,
 }
 
 type envTemplateData struct {
@@ -286,33 +292,212 @@ type envTemplateData struct {
 	InstallValue string
 }
 
-// writeEnvFile renders and atomically writes a minimal .env file.
-// If the file already exists, values for keys that are NOT controlled by the
-// install form are preserved from the existing file so that operator-specific
-// settings (tg_bot_token, db_type, etc.) survive a re-install.
-// Keys that the form controls (app_uri, http_listen, …) always use the
-// submitted values.
-func writeEnvFile(path string, r *InstallRequest, installEnabled bool) error {
-	// Collect existing non-empty key→value pairs for non-form keys.
-	existingValues := map[string]string{}
-	if data, err := os.ReadFile(path); err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
-			if idx := strings.IndexByte(line, '='); idx >= 0 {
-				k := strings.TrimSpace(line[:idx])
-				v := strings.TrimSpace(line[idx+1:])
-				if v != "" && !formControlledKeys[k] {
-					existingValues[k] = v
-				}
-			}
+// envLine is one key=value line of a .env file. lineIndex is the line's
+// position in the original text so callers can rewrite it in place.
+type envLine struct {
+	lineIndex int
+	key       string
+	value     string
+}
+
+// parseEnvLines returns every key=value line of content in file order, skipping
+// blank lines and comments. Keys and values are trimmed; a line without '=' is
+// ignored, but a line whose key trims to empty is returned so callers can reject
+// it instead of silently dropping configuration.
+func parseEnvLines(content string) []envLine {
+	lines := strings.Split(content, "\n")
+	parsed := make([]envLine, 0, len(lines))
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
 		}
+		key, value, ok := strings.Cut(trimmed, "=")
+		if !ok {
+			continue
+		}
+		parsed = append(parsed, envLine{
+			lineIndex: i,
+			key:       strings.TrimSpace(key),
+			value:     strings.TrimSpace(value),
+		})
+	}
+	return parsed
+}
+
+// preservedEnvEntries selects the pairs a rewrite must keep from an existing
+// .env: every key the install form does not own whose value is non-empty. A
+// missing or empty value is not preserved, so the template (or the form) value
+// still applies. First-seen order is kept so the rewrite is stable across runs,
+// and a duplicated key keeps its first position with its last value.
+func preservedEnvEntries(content string) []envLine {
+	parsed := parseEnvLines(content)
+	preserved := make([]envLine, 0, len(parsed))
+	seen := make(map[string]int, len(parsed))
+	for _, line := range parsed {
+		if line.key == "" || line.value == "" || formControlledKeys[line.key] {
+			continue
+		}
+		if i, ok := seen[line.key]; ok {
+			preserved[i].value = line.value
+			continue
+		}
+		seen[line.key] = len(preserved)
+		preserved = append(preserved, line)
+	}
+	return preserved
+}
+
+// resolveEnvFileMode returns the mode for the rewritten .env and for its backup.
+// The contract is "only tighter, never wider":
+//   - no existing file: 0600, so a first install never exposes the file
+//   - existing mode without group/other bits (e.g. 0400): keep it as-is
+//   - anything else (0640, 0644, …): 0600
+//
+// Re-applying the old mode verbatim is forbidden: epctl:709 provisions the first
+// .env as 0644, and honoring that would leave the signing key world-readable.
+func resolveEnvFileMode(oldMode os.FileMode, exists bool) os.FileMode {
+	if !exists {
+		return 0o600
+	}
+	if mode := oldMode.Perm(); mode&0o077 == 0 {
+		return mode
+	}
+	return 0o600
+}
+
+// verifyEnvContent enforces the post-write contract before the temporary file is
+// renamed into place: every expected key appears exactly once, no key is
+// duplicated, and no line has an empty key. A rewrite that would drop, duplicate
+// or corrupt a key is refused instead of replacing the operator's config.
+func verifyEnvContent(content string, expectedKeys []string) error {
+	parsed := parseEnvLines(content)
+	counts := make(map[string]int, len(parsed))
+	for _, line := range parsed {
+		if line.key == "" {
+			return fmt.Errorf("generated config line %d has no key", line.lineIndex+1)
+		}
+		counts[line.key]++
+	}
+	for _, key := range expectedKeys {
+		if counts[key] == 0 {
+			return fmt.Errorf("generated config is missing key %q", key)
+		}
+	}
+	for key, n := range counts {
+		if n > 1 {
+			return fmt.Errorf("generated config contains key %q %d times", key, n)
+		}
+	}
+	return nil
+}
+
+// writeEnvBackup copies the current .env next to it before the rewrite. Retention
+// is deliberate: only one .env.bak.<unix-timestamp> is kept, because every extra
+// copy is another readable copy of the signing key. The contents are never
+// logged or archived.
+func writeEnvBackup(path, content string, mode os.FileMode) error {
+	backupPath := path + ".bak." + strconv.FormatInt(time.Now().Unix(), 10)
+	if err := os.WriteFile(backupPath, []byte(content), mode); err != nil {
+		return fmt.Errorf("write config backup: %w", err)
+	}
+	// os.WriteFile honors the umask and keeps the mode of an existing file; make
+	// the policy explicit so the backup is never wider than the .env itself.
+	if err := os.Chmod(backupPath, mode); err != nil {
+		return fmt.Errorf("set config backup mode: %w", err)
+	}
+
+	dir, base := filepath.Dir(path), filepath.Base(path)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("list config directory: %w", err)
+	}
+	prefix := base + ".bak."
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() || !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		stale := filepath.Join(dir, entry.Name())
+		if stale == backupPath {
+			continue
+		}
+		if err := os.Remove(stale); err != nil {
+			return fmt.Errorf("remove stale config backup: %w", err)
+		}
+	}
+	return nil
+}
+
+// readEnvFile reads the existing .env so it can be preserved and backed up before
+// being replaced. A missing file is not an error (first install); any other read
+// failure is, because treating an unreadable config as missing would silently
+// drop every operator setting on the next rewrite.
+func readEnvFile(path string) (content string, mode os.FileMode, exists bool, err error) {
+	raw, readErr := os.ReadFile(path)
+	if errors.Is(readErr, fs.ErrNotExist) {
+		return "", 0, false, nil
+	}
+	if readErr != nil {
+		return "", 0, false, fmt.Errorf("read existing config file: %w", readErr)
+	}
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		return "", 0, false, fmt.Errorf("stat existing config file: %w", statErr)
+	}
+	return string(raw), info.Mode(), true, nil
+}
+
+// writeEnvFile renders and atomically writes the .env file.
+//
+// Rewrite contract:
+//   - Form-controlled keys always take the submitted value.
+//   - Every other non-empty value from the existing file is kept. If the
+//     template renders the key, the old value is substituted into that line; if
+//     it does not (gmpay_*, mysql_*, tg_*, …), the pair is appended in its
+//     original order, so a re-install cannot drop configuration the form never
+//     knew about.
+//   - The file mode only ever gets tighter; see resolveEnvFileMode.
+//   - The previous file is copied to .env.bak.<unix-timestamp> (same mode
+//     policy) before the rewrite.
+//   - The content is verified after it is written and before it is renamed.
+func writeEnvFile(path string, r *InstallRequest, installEnabled bool) error {
+	oldContent, oldMode, oldExists, err := readEnvFile(path)
+	if err != nil {
+		return err
+	}
+	preserved := preservedEnvEntries(oldContent)
+
+	// order_expiration_time and order_notice_max_retry are no longer form
+	// controlled, so a .env value wins over the submitted one. Say it out loud:
+	// silently ignoring the form is its own outage.
+	formValues := map[string]string{
+		"order_expiration_time":  strconv.Itoa(r.OrderExpirationTime),
+		"order_notice_max_retry": strconv.Itoa(r.OrderNoticeMaxRetry),
+	}
+	for _, line := range preserved {
+		formValue, ok := formValues[line.key]
+		if !ok || formValue == line.value {
+			continue
+		}
+		message := fmt.Sprintf("form value %s=%s ignored, effective value %s=%s comes from .env",
+			line.key, formValue, line.key, line.value)
+		if appLog.Sugar != nil {
+			appLog.Sugar.Warn("[install] " + message)
+			continue
+		}
+		// The logger is initialized after bootstrap, which runs after the install
+		// wizard; fall back to the console output this file already uses.
+		color.Warn.Printf("[install] %s\n", message)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create config directory: %w", err)
+	}
+	mode := resolveEnvFileMode(oldMode, oldExists)
+	if oldExists {
+		if err := writeEnvBackup(path, oldContent, mode); err != nil {
+			return err
+		}
 	}
 
 	// Render the template into a buffer first.
@@ -328,21 +513,44 @@ func writeEnvFile(path string, r *InstallRequest, installEnabled bool) error {
 		return fmt.Errorf("render env template: %w", err)
 	}
 
-	// For non-form keys that already had a value, substitute the existing value
-	// so the template default does not clobber operator configuration.
+	// Substitute preserved values into the template lines that render the same
+	// key, so the template default never clobbers operator configuration.
+	preservedByKey := make(map[string]string, len(preserved))
+	for _, line := range preserved {
+		preservedByKey[line.key] = line.value
+	}
 	lines := strings.Split(buf.String(), "\n")
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
+	renderedKeys := make([]string, 0, len(lines))
+	rendered := make(map[string]bool, len(lines))
+	for _, line := range parseEnvLines(buf.String()) {
+		if line.key == "" {
+			return errors.New("render env template: line without a key")
 		}
-		if idx := strings.IndexByte(trimmed, '='); idx >= 0 {
-			k := strings.TrimSpace(trimmed[:idx])
-			if existing, ok := existingValues[k]; ok {
-				lines[i] = k + "=" + existing
-			}
+		renderedKeys = append(renderedKeys, line.key)
+		rendered[line.key] = true
+		if value, ok := preservedByKey[line.key]; ok {
+			lines[line.lineIndex] = line.key + "=" + value
 		}
 	}
+
+	// Keys the template does not know must survive the rewrite: append them in
+	// their original order, exactly once each.
+	expectedKeys := make([]string, 0, len(renderedKeys)+len(preserved))
+	expectedKeys = append(expectedKeys, renderedKeys...)
+	appended := make([]string, 0, len(preserved))
+	for _, line := range preserved {
+		if rendered[line.key] {
+			continue
+		}
+		appended = append(appended, line.key+"="+line.value)
+		expectedKeys = append(expectedKeys, line.key)
+	}
+	content := strings.TrimRight(strings.Join(lines, "\n"), "\n")
+	if len(appended) > 0 {
+		content += "\n\n# kept from the previous .env: keys the install form does not manage\n" +
+			strings.Join(appended, "\n")
+	}
+	content += "\n"
 
 	f, err := os.CreateTemp(filepath.Dir(path), ".env.tmp.*")
 	if err != nil {
@@ -352,13 +560,28 @@ func writeEnvFile(path string, r *InstallRequest, installEnabled bool) error {
 	defer func() {
 		_ = os.Remove(tempPath)
 	}()
-	if _, err = fmt.Fprint(f, strings.Join(lines, "\n")); err != nil {
+	if _, err = fmt.Fprint(f, content); err != nil {
 		_ = f.Close()
-		return err
+		return fmt.Errorf("write temp config file: %w", err)
 	}
 	if err = f.Close(); err != nil {
+		return fmt.Errorf("close temp config file: %w", err)
+	}
+	// CreateTemp always starts at 0600; apply the resolved policy explicitly so a
+	// 0400 .env stays 0400 and a 0644 one is tightened.
+	if err = os.Chmod(tempPath, mode); err != nil {
+		return fmt.Errorf("set config file mode: %w", err)
+	}
+
+	// Verify what actually landed on disk before exposing it under the real name.
+	written, err := os.ReadFile(tempPath)
+	if err != nil {
+		return fmt.Errorf("read temp config file: %w", err)
+	}
+	if err = verifyEnvContent(string(written), expectedKeys); err != nil {
 		return err
 	}
+
 	if err = os.Rename(tempPath, path); err != nil {
 		return fmt.Errorf("replace config file: %w", err)
 	}

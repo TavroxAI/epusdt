@@ -217,9 +217,33 @@ func TryProcessEvmERC20Transfer(chainNetwork string, contract common.Address, to
 		log.Sugar.Warnf("[%s-WS] skip unconfigured contract %s", net, contract.Hex())
 		return
 	}
+	processEvmTokenTransfer(chainNetwork, net, tokenConfig, toAddr, rawValue, txHash, blockTsMs, contract.Hex())
+}
+
+// TryProcessEvmNativeTransfer handles a native coin transfer (ETH/BNB). Native
+// transfers emit no logs, so the caller scans block transactions instead of
+// subscribing to Transfer events.
+func TryProcessEvmNativeTransfer(chainNetwork string, toAddr common.Address, rawValue *big.Int, txHash string, blockTsMs int64, token mdb.ChainToken) {
+	defer func() {
+		if err := recover(); err != nil {
+			log.Sugar.Errorf("[%s-NATIVE] TryProcessEvmNativeTransfer panic: %v", evmChainLogLabel(chainNetwork), err)
+		}
+	}()
+
+	if !IsEvmNativeToken(token) {
+		log.Sugar.Warnf("[%s-NATIVE] skip %s/%s: not the native coin of this network", evmChainLogLabel(chainNetwork), token.Network, token.Symbol)
+		return
+	}
+	processEvmTokenTransfer(chainNetwork, evmChainLogLabel(chainNetwork), &token, toAddr, rawValue, txHash, blockTsMs,
+		"native:"+strings.ToUpper(strings.TrimSpace(token.Symbol)))
+}
+
+// processEvmTokenTransfer applies the shared amount/lock/dispatch rules for both
+// ERC20 logs and native block transactions.
+func processEvmTokenTransfer(chainNetwork string, net string, tokenConfig *mdb.ChainToken, toAddr common.Address, rawValue *big.Int, txHash string, blockTsMs int64, source string) {
 	tokenSym := strings.ToUpper(strings.TrimSpace(tokenConfig.Symbol))
 	if tokenSym == "" {
-		log.Sugar.Warnf("[%s-WS] skip contract %s with empty token symbol", net, contract.Hex())
+		log.Sugar.Warnf("[%s-WS] skip %s with empty token symbol", net, source)
 		return
 	}
 	walletAddr := strings.ToLower(toAddr.Hex())

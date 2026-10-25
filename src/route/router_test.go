@@ -1,6 +1,8 @@
 package route
 
 import (
+	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,8 +13,12 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/GMWalletApp/epusdt/config"
 	"github.com/GMWalletApp/epusdt/model/dao"
@@ -50,6 +56,11 @@ func setupTestEnv(t *testing.T) *echo.Echo {
 	viper.Set("runtime_sqlite_filename", tmpDir+"/runtime.db")
 	config.LogLevel = "info"
 	config.LogSavePath = tmpDir
+
+	// GMPay signing material: production refuses to start without it, and both
+	// the signed create-transaction response and the by-order-id snapshot are
+	// fail-closed without it.
+	installGMPayTestKeys(t)
 
 	log.Sugar = zap.NewNop().Sugar()
 	if err := log.SetLevel(config.LogLevel); err != nil {
@@ -3135,4 +3146,385 @@ func TestSwitchNetwork_OkPayIntegration(t *testing.T) {
 		t.Fatalf("missing payment_url in response: %v", dataMap)
 	}
 	t.Logf("OkPay payment_url=%s", paymentURL)
+}
+
+// reconcileTestKey is the instance-wide reconcile secret the by-order-id tests
+// install through the real .env loader, so the endpoint verifies exactly the key
+// a deployment would use.
+const reconcileTestKey = "by-order-id-reconcile-test-key-0001"
+
+// byOrderIdSigningKey returns the Ed25519 key pair behind the signed snapshots.
+// The seed is fixed so key_id assertions stay deterministic.
+func byOrderIdSigningKey(t *testing.T) ed25519.PrivateKey {
+	t.Helper()
+
+	seed := sha256.Sum256([]byte("epusdt-by-order-id-test-seed"))
+	return ed25519.NewKeyFromSeed(seed[:])
+}
+
+// installGMPayTestKeys drives the production loader (config.Init) instead of
+// poking unexported state: both GMPay keys come from .env only and are
+// fail-closed, so this is the only faithful way to exercise them. The route
+// fixture installs them for every test because a real deployment cannot start
+// without them, and because signed create-transaction responses are mandatory.
+func installGMPayTestKeys(t *testing.T) {
+	t.Helper()
+
+	privateKey := byOrderIdSigningKey(t)
+	content := "app_name=epusdt-test\n"
+	content += "gmpay_signing_key=" + hex.EncodeToString(privateKey.Seed()) + "\n"
+	content += "gmpay_reconcile_key=" + reconcileTestKey + "\n"
+	envPath := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(envPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write gmpay test env: %v", err)
+	}
+
+	config.SetConfigPath(envPath)
+	t.Cleanup(func() { config.SetConfigPath("") })
+	config.Init()
+}
+
+// signReconcileQuery computes the request signature independently of the
+// middleware: sorted "k=v" pairs joined with "&", empty values dropped, HMAC-
+// SHA256 hex over the result. Reimplementing the rule here pins the documented
+// wire contract instead of asking the code under test what the answer is.
+func signReconcileQuery(orderID string, pid string, ts int64, key string) string {
+	pairs := make([]string, 0, 3)
+	for _, pair := range []string{
+		"order_id=" + orderID,
+		"pid=" + pid,
+		"ts=" + strconv.FormatInt(ts, 10),
+	} {
+		_, value, _ := strings.Cut(pair, "=")
+		if value == "" {
+			continue
+		}
+		pairs = append(pairs, pair)
+	}
+	sort.Strings(pairs)
+
+	mac := hmac.New(sha256.New, []byte(key))
+	_, _ = mac.Write([]byte(strings.Join(pairs, "&")))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func doByOrderIdLookup(e *echo.Echo, orderID string, pid string, ts int64, signature string) *httptest.ResponseRecorder {
+	query := url.Values{}
+	query.Set("pid", pid)
+	query.Set("ts", strconv.FormatInt(ts, 10))
+	query.Set("signature", signature)
+
+	req := httptest.NewRequest(http.MethodGet, "/payments/gmpay/v1/orders/by-order-id/"+url.PathEscape(orderID)+"?"+query.Encode(), nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	return rec
+}
+
+// canonicalSnapshotForTest reimplements the canonical form the merchant must
+// apply to the received body: drop "signature", drop empty strings, format
+// numbers without trailing zeros, keep "true"/"false", sort the "k=v" pairs and
+// join them with "&".
+func canonicalSnapshotForTest(t *testing.T, payload map[string]interface{}) string {
+	t.Helper()
+
+	pairs := make([]string, 0, len(payload))
+	for key, raw := range payload {
+		if key == "signature" {
+			continue
+		}
+		var value string
+		switch typed := raw.(type) {
+		case string:
+			value = typed
+		case float64:
+			value = strconv.FormatFloat(typed, 'f', -1, 64)
+		case bool:
+			value = strconv.FormatBool(typed)
+		default:
+			t.Fatalf("unexpected snapshot field type for %q: %T", key, raw)
+		}
+		if value == "" {
+			continue
+		}
+		pairs = append(pairs, key+"="+value)
+	}
+	sort.Strings(pairs)
+	return strings.Join(pairs, "&")
+}
+
+// TestGMPayOrderByOrderIdRejectsBadReconcileSignatures is the request-side auth
+// matrix. Every case is answered with 401, which is what keeps an auth failure
+// from being classified as "order not found" by the merchant.
+//
+// The "no reconcile key configured" case is not here: loadGMPayKeys() either
+// assigns both keys or panics, and config exposes no setter, so it cannot be
+// constructed inside a test process that already loaded the shared fixture keys.
+// That guarantee is covered at the config layer (missing/malformed seed and a
+// too-short reconcile key make startup fail closed) plus the fixture itself.
+func TestGMPayOrderByOrderIdRejectsBadReconcileSignatures(t *testing.T) {
+	e := setupTestEnv(t)
+	useRspErrorHTTPStatuses(e)
+
+	const orderID = "by-order-id-auth-001"
+	createCheckoutCounterRespTestOrder(t, e, orderID)
+
+	now := time.Now().Unix()
+	cases := []struct {
+		name      string
+		orderID   string
+		pid       string
+		ts        int64
+		signature string
+	}{
+		{
+			name:      "wrong reconcile key",
+			orderID:   orderID,
+			pid:       testAPIToken,
+			ts:        now,
+			signature: signReconcileQuery(orderID, testAPIToken, now, "another-instance-reconcile-key-01"),
+		},
+		{
+			name:      "ts 301s in the past",
+			orderID:   orderID,
+			pid:       testAPIToken,
+			ts:        now - 301,
+			signature: signReconcileQuery(orderID, testAPIToken, now-301, reconcileTestKey),
+		},
+		{
+			name:      "ts 301s in the future",
+			orderID:   orderID,
+			pid:       testAPIToken,
+			ts:        now + 301,
+			signature: signReconcileQuery(orderID, testAPIToken, now+301, reconcileTestKey),
+		},
+		{
+			name:      "order id tampered between signature and path",
+			orderID:   "by-order-id-auth-swapped",
+			pid:       testAPIToken,
+			ts:        now,
+			signature: signReconcileQuery(orderID, testAPIToken, now, reconcileTestKey),
+		},
+		{
+			name:      "missing signature",
+			orderID:   orderID,
+			pid:       testAPIToken,
+			ts:        now,
+			signature: "",
+		},
+		{
+			name:      "non hex signature",
+			orderID:   orderID,
+			pid:       testAPIToken,
+			ts:        now,
+			signature: "not-a-hex-signature",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := doByOrderIdLookup(e, tc.orderID, tc.pid, tc.ts, tc.signature)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+			}
+			if body := rec.Body.String(); strings.Contains(body, "10008") || strings.Contains(body, "10045") {
+				t.Fatalf("auth rejection leaked order state: %s", body)
+			}
+		})
+	}
+}
+
+// TestGMPayOrderByOrderIdReturnsVerifiableSnapshot covers the happy path: the
+// body carries the documented snapshot fields, no-store, and an Ed25519
+// signature that verifies against an independently recomputed canonical form.
+func TestGMPayOrderByOrderIdReturnsVerifiableSnapshot(t *testing.T) {
+	e := setupTestEnv(t)
+
+	const orderID = "by-order-id-happy-001"
+	tradeID := createCheckoutCounterRespTestOrder(t, e, orderID)
+	publicKey := byOrderIdSigningKey(t).Public().(ed25519.PublicKey)
+	publicKeyHex := hex.EncodeToString(publicKey)
+
+	now := time.Now().Unix()
+	rec := doByOrderIdLookup(e, orderID, testAPIToken, now, signReconcileQuery(orderID, testAPIToken, now, reconcileTestKey))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+
+	resp := parseResp(t, rec)
+	snapshot, ok := resp["data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected snapshot data, got: %v", resp)
+	}
+	if got := int(resp["status_code"].(float64)); got != http.StatusOK {
+		t.Fatalf("status_code = %d, want 200; response=%v", got, resp)
+	}
+	if got, _ := snapshot["order_id"].(string); got != orderID {
+		t.Fatalf("order_id = %v, want %q", snapshot["order_id"], orderID)
+	}
+	if got, _ := snapshot["trade_id"].(string); got != tradeID {
+		t.Fatalf("trade_id = %v, want %q", snapshot["trade_id"], tradeID)
+	}
+	pid, _ := snapshot["pid"].(string)
+	if pid == "" {
+		t.Fatalf("expected a non-empty pid in the snapshot: %v", snapshot)
+	}
+	if got, _ := snapshot["sign_type"].(string); got != "ed25519" {
+		t.Fatalf("sign_type = %v, want ed25519", snapshot["sign_type"])
+	}
+	if got, _ := snapshot["key_id"].(string); got != publicKeyHex[:8] {
+		t.Fatalf("key_id = %v, want %q", snapshot["key_id"], publicKeyHex[:8])
+	}
+	for _, field := range []string{"created_at", "expiration_time"} {
+		if got, _ := snapshot[field].(float64); got <= 0 {
+			t.Fatalf("%s = %v, want a positive millisecond timestamp", field, snapshot[field])
+		}
+	}
+
+	signature, _ := snapshot["signature"].(string)
+	decoded, err := hex.DecodeString(signature)
+	if err != nil || len(decoded) != ed25519.SignatureSize {
+		t.Fatalf("signature must be hex of %d bytes, got %q (err=%v)", ed25519.SignatureSize, signature, err)
+	}
+	canonical := canonicalSnapshotForTest(t, snapshot)
+	if !ed25519.Verify(publicKey, []byte(canonical), decoded) {
+		t.Fatalf("snapshot signature does not verify against the independently computed canonical form: %s", canonical)
+	}
+	// Everything the merchant uses to reconcile must be inside the signature.
+	for _, want := range []string{
+		"order_id=" + orderID,
+		"pid=" + pid,
+		"trade_id=" + tradeID,
+		"amount=",
+		"actual_amount=",
+		"currency=CNY",
+		"status=1",
+		"token=USDT",
+		"network=tron",
+		"receive_address=TTestTronAddress001",
+		"created_at=",
+		"expiration_time=",
+		"sign_type=ed25519",
+		"key_id=" + publicKeyHex[:8],
+	} {
+		if !strings.Contains(canonical, want) {
+			t.Fatalf("canonical form is missing %q: %s", want, canonical)
+		}
+	}
+}
+
+// TestGMPayOrderByOrderIdReportsMissingOrderAsNotExists covers the not-found
+// contract: HTTP 400 + status_code=10008, and explicitly not 10045.
+func TestGMPayOrderByOrderIdReportsMissingOrderAsNotExists(t *testing.T) {
+	e := setupTestEnv(t)
+
+	const orderID = "by-order-id-missing-001"
+	now := time.Now().Unix()
+	rec := doByOrderIdLookup(e, orderID, testAPIToken, now, signReconcileQuery(orderID, testAPIToken, now, reconcileTestKey))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+
+	resp := parseResp(t, rec)
+	code := int(resp["status_code"].(float64))
+	if code == 10045 {
+		t.Fatalf("a missing order must not be reported as 10045 (api key unavailable); response=%v", resp)
+	}
+	if code != 10008 {
+		t.Fatalf("status_code = %d, want 10008; response=%v", code, resp)
+	}
+	if got, _ := resp["message"].(string); got != constant.Errno[10008] {
+		t.Fatalf("message = %q, want %q", got, constant.Errno[10008])
+	}
+}
+
+// TestGMPayOrderByOrderIdReportsDanglingApiKeyAsUnavailable covers the other
+// failure class: the order row exists, so a soft-deleted api_keys row is 10045
+// (a pull failure) and must never be reported — or counted — as not found.
+func TestGMPayOrderByOrderIdReportsDanglingApiKeyAsUnavailable(t *testing.T) {
+	e := setupTestEnv(t)
+
+	const orderID = "by-order-id-dangling-key-001"
+	tradeID := createCheckoutCounterRespTestOrder(t, e, orderID)
+
+	deletedKey := &mdb.ApiKey{
+		Name:      "by-order-id-deleted-key",
+		Pid:       "by-order-id-pid-2",
+		SecretKey: "by-order-id-secret-2",
+		Status:    mdb.ApiKeyStatusEnable,
+	}
+	if err := dao.Mdb.Create(deletedKey).Error; err != nil {
+		t.Fatalf("create api key: %v", err)
+	}
+	if err := data.DeleteApiKeyByID(deletedKey.ID); err != nil {
+		t.Fatalf("soft-delete api key: %v", err)
+	}
+	if err := dao.Mdb.Model(&mdb.Orders{}).Where("trade_id = ?", tradeID).Update("api_key_id", deletedKey.ID).Error; err != nil {
+		t.Fatalf("point order at the deleted api key: %v", err)
+	}
+
+	now := time.Now().Unix()
+	rec := doByOrderIdLookup(e, orderID, testAPIToken, now, signReconcileQuery(orderID, testAPIToken, now, reconcileTestKey))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+
+	resp := parseResp(t, rec)
+	code := int(resp["status_code"].(float64))
+	if code == 10008 {
+		t.Fatalf("an order with a missing api key must not be reported as 10008 (not found); response=%v", resp)
+	}
+	if code != 10045 {
+		t.Fatalf("status_code = %d, want 10045; response=%v", code, resp)
+	}
+}
+
+// TestCreateOrderGmpayV1RejectsDuplicateOrderId keeps the create contract that
+// the reconciliation lookup relies on: order_id is the merchant's unique key.
+func TestCreateOrderGmpayV1RejectsDuplicateOrderId(t *testing.T) {
+	e := setupTestEnv(t)
+
+	const orderID = "by-order-id-duplicate-001"
+	createCheckoutCounterRespTestOrder(t, e, orderID)
+
+	rec := doPost(e, "/payments/gmpay/v1/order/create-transaction", signBody(map[string]interface{}{
+		"order_id":     orderID,
+		"amount":       1.00,
+		"token":        "usdt",
+		"currency":     "cny",
+		"network":      "tron",
+		"notify_url":   "https://93.184.216.34/notify",
+		"redirect_url": "https://merchant.example/return",
+	}))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	resp := parseResp(t, rec)
+	if got := int(resp["status_code"].(float64)); got != 10002 {
+		t.Fatalf("status_code = %d, want 10002; response=%v", got, resp)
+	}
+}
+
+// TestCheckoutCounterRespIgnoresDanglingApiKey is the E4 regression guard: the
+// browser-facing checkout counter must keep returning 200 for an order whose
+// api_key_id dangles, and must not start emitting the snapshot-only keys.
+func TestCheckoutCounterRespIgnoresDanglingApiKey(t *testing.T) {
+	e := setupTestEnv(t)
+
+	const orderID = "checkout-counter-dangling-001"
+	tradeID := createCheckoutCounterRespTestOrder(t, e, orderID)
+	if err := dao.Mdb.Model(&mdb.Orders{}).Where("trade_id = ?", tradeID).Update("api_key_id", 999999).Error; err != nil {
+		t.Fatalf("point order at a dangling api key: %v", err)
+	}
+
+	checkoutData := getCheckoutCounterRespData(t, e, tradeID)
+	if got, _ := checkoutData["trade_id"].(string); got != tradeID {
+		t.Fatalf("trade_id = %v, want %q", checkoutData["trade_id"], tradeID)
+	}
+	for _, key := range []string{"order_id", "pid", "block_transaction_id", "signature", "sign_type", "key_id"} {
+		if _, exists := checkoutData[key]; exists {
+			t.Fatalf("checkout counter response must not expose the snapshot-only field %q: %#v", key, checkoutData)
+		}
+	}
 }

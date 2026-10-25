@@ -471,3 +471,96 @@ func TestGetRateForCoinCallsRateAPIOnceForUsdtCnyFailure(t *testing.T) {
 		t.Fatalf("rate api call count = %d, want 1", callCount)
 	}
 }
+
+func installGMPayViperValues(t *testing.T, values map[string]string) {
+	t.Helper()
+
+	keys := []string{"install", "gmpay_signing_key", "gmpay_reconcile_key"}
+	previous := make(map[string]string, len(keys))
+	for _, key := range keys {
+		previous[key] = viper.GetString(key)
+	}
+	for key, value := range values {
+		viper.Set(key, value)
+	}
+	prevSigningKey, prevReconcileKey := gmpaySigningKey, gmpayReconcileKey
+	t.Cleanup(func() {
+		for _, key := range keys {
+			viper.Set(key, previous[key])
+		}
+		gmpaySigningKey, gmpayReconcileKey = prevSigningKey, prevReconcileKey
+	})
+}
+
+func TestLoadGMPayKeysFailsClosed(t *testing.T) {
+	const seed = "6c1c7d4d6f2a4a3c8f8f1b0f3f9e2a5d4c6b7a8e9f0a1b2c3d4e5f60718293a4"
+	const reconcileKey = "reconcile-key-0123456789abcdef0123"
+
+	valid := map[string]string{
+		"gmpay_signing_key":   seed,
+		"gmpay_reconcile_key": reconcileKey,
+	}
+	cases := []struct {
+		name     string
+		values   map[string]string
+		wantFail bool
+	}{
+		{"both keys present", valid, false},
+		{"missing signing key", map[string]string{"gmpay_reconcile_key": reconcileKey}, true},
+		{"malformed signing key", map[string]string{"gmpay_signing_key": "not-hex", "gmpay_reconcile_key": reconcileKey}, true},
+		{"pem instead of seed", map[string]string{"gmpay_signing_key": "-----BEGIN PRIVATE KEY-----", "gmpay_reconcile_key": reconcileKey}, true},
+		{"missing reconcile key", map[string]string{"gmpay_signing_key": seed}, true},
+		{"short reconcile key", map[string]string{"gmpay_signing_key": seed, "gmpay_reconcile_key": "too-short"}, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			installGMPayViperValues(t, map[string]string{"install": ""})
+			installGMPayViperValues(t, tc.values)
+			// Start from an empty state so a previous successful load cannot
+			// mask a failure in this case.
+			gmpaySigningKey, gmpayReconcileKey = nil, ""
+
+			var recovered any
+			func() {
+				defer func() {
+					recovered = recover()
+				}()
+				loadGMPayKeys()
+			}()
+			if (recovered != nil) != tc.wantFail {
+				t.Fatalf("panic = %v, want %v (panic value: %v)", recovered != nil, tc.wantFail, recovered)
+			}
+			if tc.wantFail {
+				if _, err := GetGMPaySigningKey(); err == nil {
+					t.Fatal("a failed load must not leave a usable signing key behind")
+				}
+				return
+			}
+			if _, err := GetGMPaySigningKey(); err != nil {
+				t.Fatalf("GetGMPaySigningKey() error = %v", err)
+			}
+			got, err := GetGMPayReconcileKey()
+			if err != nil || got != reconcileKey {
+				t.Fatalf("GetGMPayReconcileKey() = %q, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestLoadGMPayKeysSkipsValidationDuringInstall(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	viper.Set("install", "true")
+	gmpaySigningKey = nil
+	gmpayReconcileKey = ""
+
+	loadGMPayKeys()
+
+	if _, err := GetGMPaySigningKey(); err == nil {
+		t.Fatal("install mode must not produce a usable signing key")
+	}
+	if _, err := GetGMPayReconcileKey(); err == nil {
+		t.Fatal("install mode must not produce a usable reconcile key")
+	}
+}

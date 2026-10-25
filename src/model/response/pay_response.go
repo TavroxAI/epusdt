@@ -16,6 +16,17 @@ type CheckoutCounterResponse struct {
 	CreatedAt      int64   `json:"created_at" example:"1713264000"`                                                 // 订单创建时间 时间戳
 	ServerTime     int64   `json:"server_time" example:"1713264100"`                                                // 服务器当前时间 时间戳
 	IsSelected     bool    `json:"is_selected" example:"false"`                                                     // 是否已选择当前支付方式；status=4 占位订单和刚补全的占位父单为 false
+	// 以下六个字段只由 GET /payments/gmpay/v1/orders/by-order-id/{order_id} 的
+	// 签名快照填充：order_id 是商户单号，pid 是下单 API key，
+	// block_transaction_id 是链上/第三方交易号，signature/sign_type/key_id 是
+	// Ed25519 签名材料。收银台与 switch-network 一律不填；全部 omitempty 保证
+	// 那两个端点的线上 JSON 不新增空键，浏览器侧字节不变。
+	OrderId            string `json:"order_id,omitempty" example:"ORD20260416001"`
+	Pid                string `json:"pid,omitempty" example:"1000"`
+	BlockTransactionId string `json:"block_transaction_id,omitempty" example:"0xabc123..."`
+	Signature          string `json:"signature,omitempty"`
+	SignType           string `json:"sign_type,omitempty" example:"ed25519"`
+	KeyId              string `json:"key_id,omitempty" example:"a1b2c3d4"`
 }
 
 type CheckStatusResponse struct {

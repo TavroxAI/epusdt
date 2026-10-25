@@ -1,8 +1,10 @@
 package service
 
 import (
+	"crypto/ed25519"
 	cryptorand "crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -16,9 +18,11 @@ import (
 	"github.com/GMWalletApp/epusdt/model/response"
 	addressutil "github.com/GMWalletApp/epusdt/util/address"
 	"github.com/GMWalletApp/epusdt/util/constant"
+	"github.com/GMWalletApp/epusdt/util/json"
 	"github.com/GMWalletApp/epusdt/util/log"
 	"github.com/GMWalletApp/epusdt/util/math"
 	"github.com/GMWalletApp/epusdt/util/security"
+	"github.com/GMWalletApp/epusdt/util/sign"
 	"github.com/dromara/carbon/v2"
 	"github.com/shopspring/decimal"
 )
@@ -88,6 +92,24 @@ func ensureEnabledOrderAsset(network, token string) (*mdb.ChainToken, error) {
 	return tokenRow, nil
 }
 
+// tokenMinimumOrderAmount returns the smallest crypto amount an order may charge
+// for one token row: the operator-configured min_amount when set, otherwise the
+// historical 0.01 floor. Native coins (ETH, BNB) are worth orders of magnitude
+// more per unit than stablecoins, so that floor would reject every small native
+// top-up; for them the floor is the smallest amount the configured precision can
+// represent.
+func tokenMinimumOrderAmount(token *mdb.ChainToken) decimal.Decimal {
+	if token != nil {
+		if token.MinAmount > 0 {
+			return decimal.NewFromFloat(token.MinAmount)
+		}
+		if IsEvmNativeToken(*token) {
+			return decimal.New(1, int32(-data.GetAmountPrecision()))
+		}
+	}
+	return decimal.NewFromFloat(UsdtMinimumPaymentAmount)
+}
+
 func validateCreateTransactionTokenNetwork(token, network string) error {
 	if (token == "") != (network == "") {
 		return constant.ParamsMarshalErr
@@ -108,6 +130,92 @@ func buildCreateTransactionResponse(order *mdb.Orders) *response.CreateTransacti
 		ExpirationTime: carbon.Now().AddMinutes(config.GetOrderExpirationTime()).Timestamp(),
 		PaymentUrl:     fmt.Sprintf("%s/pay/checkout-counter/%s", config.GetAppUri(), order.TradeId),
 	}
+}
+
+// gmpaySignTypeEd25519 is the only sign_type GMPay responses carry. It takes
+// part in the signature, so rewriting it to hmac invalidates the response
+// instead of downgrading the merchant to a weaker verifier.
+const gmpaySignTypeEd25519 = "ed25519"
+
+// errCreateResponseUnsigned is returned when a created order cannot be handed
+// back with a verifiable signature. It is HTTP 500 on purpose: the order row
+// already exists, so the merchant must treat the create as uncertain instead of
+// trusting an unverifiable payment_url. Business codes keep their existing 400
+// mapping and 401 stays reserved for signature verification failures.
+var errCreateResponseUnsigned = &constant.RspError{
+	Code: 500,
+	Msg:  "order created but the signed response could not be verified",
+}
+
+// buildSignedCreateTransactionResponse builds the create-order response and
+// signs it. The signature covers every field the merchant validates (trade_id,
+// order_id, amount, actual_amount, currency, token, status, expiration_time and
+// the absolute payment_url) plus sign_type and key_id, so an intermediary
+// cannot rewrite payment_url, amount or currency.
+func buildSignedCreateTransactionResponse(order *mdb.Orders) (*response.CreateTransactionResponse, error) {
+	resp := buildCreateTransactionResponse(order)
+	priv, err := config.GetGMPaySigningKey()
+	if err != nil {
+		return nil, createResponseSignFailed(resp.TradeId, err)
+	}
+	pub, ok := priv.Public().(ed25519.PublicKey)
+	if !ok {
+		return nil, createResponseSignFailed(resp.TradeId, errors.New("signing key has no ed25519 public half"))
+	}
+
+	// sign_type and key_id participate in the signature, so they are set before
+	// the first marshal. signature stays empty until it is written back.
+	resp.SignType = gmpaySignTypeEd25519
+	resp.KeyId = sign.KeyIDFor(pub)
+
+	// Sign the canonical form of the serialized response, not the struct: every
+	// value keeps its wire type (amount float64, integers int/int64, never
+	// float32 and never a pre-formatted string) so the merchant reproduces the
+	// exact same canonical string.
+	unsigned, err := json.Cjson.Marshal(resp)
+	if err != nil {
+		return nil, createResponseSignFailed(resp.TradeId, err)
+	}
+	params := make(map[string]interface{})
+	if err = json.Cjson.Unmarshal(unsigned, &params); err != nil {
+		return nil, createResponseSignFailed(resp.TradeId, err)
+	}
+	resp.Signature, err = sign.SignEd25519(params, priv)
+	if err != nil {
+		return nil, createResponseSignFailed(resp.TradeId, err)
+	}
+
+	// Self-check the final bytes before returning: the handler serializes this
+	// struct, so a signature that does not cover its own serialized form would
+	// ship a response the merchant must reject. Marshal, decode, re-canonicalise
+	// and verify with the public half; on failure return an error instead.
+	wire, err := json.Cjson.Marshal(resp)
+	if err != nil {
+		return nil, createResponseSignFailed(resp.TradeId, err)
+	}
+	wireParams := make(map[string]interface{})
+	if err = json.Cjson.Unmarshal(wire, &wireParams); err != nil {
+		return nil, createResponseSignFailed(resp.TradeId, err)
+	}
+	canonical, err := sign.Canonical(wireParams)
+	if err != nil {
+		return nil, createResponseSignFailed(resp.TradeId, err)
+	}
+	rawSignature, err := hex.DecodeString(resp.Signature)
+	if err != nil {
+		return nil, createResponseSignFailed(resp.TradeId, err)
+	}
+	if !ed25519.Verify(pub, []byte(canonical), rawSignature) {
+		return nil, createResponseSignFailed(resp.TradeId, errors.New("signature does not cover the bytes being returned"))
+	}
+	return resp, nil
+}
+
+// createResponseSignFailed logs why a created order could not be returned with
+// a verifiable signature and returns the stable internal error for it.
+func createResponseSignFailed(tradeID string, cause error) error {
+	log.Sugar.Errorf("[order] sign create-transaction response failed, trade_id=%s, err=%v", tradeID, cause)
+	return errCreateResponseUnsigned
 }
 
 // CreateTransaction creates a new payment order.
@@ -168,13 +276,14 @@ func CreateTransaction(req *request.CreateTransactionRequest, apiKey *mdb.ApiKey
 		if err = data.CreateOrderWithTransaction(dao.Mdb, order); err != nil {
 			return nil, err
 		}
-		return buildCreateTransactionResponse(order), nil
+		return buildSignedCreateTransactionResponse(order)
 	}
 
 	if !data.IsChainEnabled(network) {
 		return nil, constant.ChainNotEnabled
 	}
-	if _, err = ensureEnabledOrderAsset(network, token); err != nil {
+	assetToken, err := ensureEnabledOrderAsset(network, token)
+	if err != nil {
 		return nil, err
 	}
 
@@ -184,7 +293,7 @@ func CreateTransaction(req *request.CreateTransactionRequest, apiKey *mdb.ApiKey
 	}
 
 	decimalTokenAmount := decimalPayAmount.Mul(decimal.NewFromFloat(rate))
-	if decimalTokenAmount.Cmp(decimal.NewFromFloat(UsdtMinimumPaymentAmount)) == -1 {
+	if decimalTokenAmount.Cmp(tokenMinimumOrderAmount(assetToken)) == -1 {
 		return nil, constant.PayAmountErr
 	}
 
@@ -236,7 +345,7 @@ func CreateTransaction(req *request.CreateTransactionRequest, apiKey *mdb.ApiKey
 		return nil, err
 	}
 
-	return buildCreateTransactionResponse(order), nil
+	return buildSignedCreateTransactionResponse(order)
 }
 
 // OrderProcessing marks an order as paid and releases its sqlite reservation.
@@ -630,7 +739,8 @@ func SwitchNetwork(req *request.SwitchNetworkRequest) (*response.CheckoutCounter
 	if !data.IsChainEnabled(network) {
 		return nil, constant.ChainNotEnabled
 	}
-	if _, err = ensureEnabledOrderAsset(network, token); err != nil {
+	assetToken, err := ensureEnabledOrderAsset(network, token)
+	if err != nil {
 		return nil, err
 	}
 
@@ -641,7 +751,7 @@ func SwitchNetwork(req *request.SwitchNetworkRequest) (*response.CheckoutCounter
 	}
 	decimalPayAmount := decimal.NewFromFloat(parent.Amount)
 	decimalTokenAmount := decimalPayAmount.Mul(decimal.NewFromFloat(rate))
-	if decimalTokenAmount.Cmp(decimal.NewFromFloat(UsdtMinimumPaymentAmount)) == -1 {
+	if decimalTokenAmount.Cmp(tokenMinimumOrderAmount(assetToken)) == -1 {
 		return nil, constant.PayAmountErr
 	}
 
@@ -709,7 +819,8 @@ func completeWaitSelectOrder(parent *mdb.Orders, token string, network string) (
 	if !data.IsChainEnabled(network) {
 		return nil, constant.ChainNotEnabled
 	}
-	if _, err := ensureEnabledOrderAsset(network, token); err != nil {
+	assetToken, err := ensureEnabledOrderAsset(network, token)
+	if err != nil {
 		return nil, err
 	}
 
@@ -719,7 +830,7 @@ func completeWaitSelectOrder(parent *mdb.Orders, token string, network string) (
 	}
 	decimalPayAmount := decimal.NewFromFloat(parent.Amount)
 	decimalTokenAmount := decimalPayAmount.Mul(decimal.NewFromFloat(rate))
-	if decimalTokenAmount.Cmp(decimal.NewFromFloat(UsdtMinimumPaymentAmount)) == -1 {
+	if decimalTokenAmount.Cmp(tokenMinimumOrderAmount(assetToken)) == -1 {
 		return nil, constant.PayAmountErr
 	}
 

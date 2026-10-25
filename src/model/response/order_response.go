@@ -12,6 +12,9 @@ type CreateTransactionResponse struct {
 	Status         int     `json:"status" enums:"1,2,3,4" example:"1"`                                              // 订单状态 1=等待支付 2=支付成功 3=已过期 4=等待选择支付网络/币种
 	ExpirationTime int64   `json:"expiration_time" example:"1713264600"`                                            // 过期时间 时间戳
 	PaymentUrl     string  `json:"payment_url" example:"https://pay.example.com/checkout/3nQ9pL2xV7sK1mR8cT4yB_aZ"` // 收银台地址
+	SignType       string  `json:"sign_type" example:"ed25519"`                                                     // 固定 ed25519，参与签名
+	KeyId          string  `json:"key_id" example:"9f2c1a7b"`                                                       // 签发公钥 hex 前 8 位，参与签名
+	Signature      string  `json:"signature" example:"498975a97bc34563bdb14df53fc18054"`                            // Ed25519(signing_key, sorted_params) 小写 hex，本身不参与签名
 }
 
 // OrderNotifyResponse 订单异步回调结构体
@@ -24,7 +27,9 @@ type OrderNotifyResponse struct {
 	ReceiveAddress     string  `json:"receive_address" example:"TTestTronAddress001"`                                        //  收款钱包地址
 	Token              string  `json:"token" example:"USDT"`                                                                 // 所属币种 TRX USDT......
 	BlockTransactionId string  `json:"block_transaction_id" example:"0xabc123..."`                                           // 区块id
-	Signature          string  `json:"signature" example:"498975a97bc34563bdb14df53fc18054645df9684d6c67d9b9dd90ec62be1018"` // GMPay 签名 HMAC-SHA256(secret_key, sorted_params)
+	SignType           string  `json:"sign_type" example:"ed25519"`                                                          // 固定 ed25519，参与签名，防止回调被降级成 HMAC
+	KeyId              string  `json:"key_id" example:"9f2c1a7b"`                                                            // 签发公钥 hex 前 8 位，参与签名，支持换钥重叠期
+	Signature          string  `json:"signature" example:"498975a97bc34563bdb14df53fc18054645df9684d6c67d9b9dd90ec62be1018"` // Ed25519(signing_key, sorted_params) 小写 hex，本身不参与签名
 	//  订单状态 1=等待支付 2=支付成功 3=已过期
 	Status int `json:"status" enums:"1,2,3" example:"2"`
 }

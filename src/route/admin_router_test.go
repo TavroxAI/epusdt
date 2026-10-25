@@ -474,6 +474,25 @@ func TestAdminChainTokens_CRUD(t *testing.T) {
 	t.Logf("ListChainTokens: %s", rec.Body.String())
 	assertOK(t, rec)
 
+	// The chain's native coin is the one row allowed to omit the contract address:
+	// the EVM native scanner reads it from block transactions.
+	rec = doPostAdmin(e, "/admin/api/v1/chain-tokens", map[string]interface{}{
+		"network":  "ethereum",
+		"symbol":   "ETH",
+		"decimals": 18,
+	}, token)
+	t.Logf("CreateNativeChainToken: %s", rec.Body.String())
+	assertOK(t, rec)
+
+	// Any other contract-less EVM row would be a payment method no scanner reports.
+	rec = doPostAdmin(e, "/admin/api/v1/chain-tokens", map[string]interface{}{
+		"network":  "ethereum",
+		"symbol":   "NOSCANNER",
+		"decimals": 18,
+	}, token)
+	t.Logf("CreateContractlessChainToken: %s", rec.Body.String())
+	assertErrorCode(t, rec, 10047)
+
 	// Create.
 	rec = doPostAdmin(e, "/admin/api/v1/chain-tokens", map[string]interface{}{
 		"network":          "ethereum",
@@ -496,6 +515,14 @@ func TestAdminChainTokens_CRUD(t *testing.T) {
 	}, token)
 	t.Logf("UpdateChainToken: %s", rec.Body.String())
 	assertOK(t, rec)
+
+	// Clearing the contract of an enabled EVM token would turn it into the same
+	// undetectable native row, so the patch has to be refused too.
+	rec = doPatchAdmin(e, "/admin/api/v1/chain-tokens/"+tokenIDStr, map[string]interface{}{
+		"contract_address": "",
+	}, token)
+	t.Logf("UpdateChainTokenToNative: %s", rec.Body.String())
+	assertErrorCode(t, rec, 10047)
 
 	// Change status.
 	rec = doPostAdmin(e, "/admin/api/v1/chain-tokens/"+tokenIDStr+"/status", map[string]interface{}{

@@ -1,7 +1,10 @@
 package mq
 
 import (
+	"crypto/ed25519"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -13,6 +16,7 @@ import (
 	"github.com/GMWalletApp/epusdt/model/response"
 	"github.com/GMWalletApp/epusdt/model/service"
 	"github.com/GMWalletApp/epusdt/util/http_client"
+	"github.com/GMWalletApp/epusdt/util/json"
 	"github.com/GMWalletApp/epusdt/util/log"
 	"github.com/GMWalletApp/epusdt/util/sign"
 )
@@ -219,7 +223,15 @@ func sendOrderCallback(order *mdb.Orders) error {
 
 	default:
 
-		client := http_client.GetHttpClient()
+		priv, err := config.GetGMPaySigningKey()
+		if err != nil {
+			return err
+		}
+		pub, ok := priv.Public().(ed25519.PublicKey)
+		if !ok {
+			return errors.New("gmpay signing key has no public half")
+		}
+
 		orderResp := response.OrderNotifyResponse{
 			Pid:                apiKeyRow.Pid,
 			TradeId:            order.TradeId,
@@ -230,16 +242,58 @@ func sendOrderCallback(order *mdb.Orders) error {
 			Token:              order.Token,
 			BlockTransactionId: order.BlockTransactionId,
 			Status:             mdb.StatusPaySuccess,
+			SignType:           "ed25519",
+			KeyId:              sign.KeyIDFor(pub),
 		}
-		signature, err := sign.GetHMACSHA256(orderResp, apiKeyRow.SecretKey)
+
+		// Sign the bytes that will be sent, not the struct. Marshal without the
+		// signature, decode the exact field encoding that marshal produced, sign
+		// its canonical form, write the signature back and marshal again: the
+		// second body is the one that leaves the process. Handing the struct to
+		// resty instead would let another encoder re-encode the numbers after the
+		// signature was computed, so a receiver could never reproduce it.
+		unsignedBody, err := json.Cjson.Marshal(orderResp)
+		if err != nil {
+			return err
+		}
+		params := make(map[string]interface{})
+		if err = json.Cjson.Unmarshal(unsignedBody, &params); err != nil {
+			return err
+		}
+		signature, err := sign.SignEd25519(params, priv)
 		if err != nil {
 			return err
 		}
 		orderResp.Signature = signature
+		body, err := json.Cjson.Marshal(orderResp)
+		if err != nil {
+			return err
+		}
 
-		resp, err := client.R().
+		// Self-check on the final bytes before they reach the wire: decode the
+		// body, recompute its canonical form and verify the signature it carries
+		// with the public half. Unverified bytes are never sent silently.
+		wireParams := make(map[string]interface{})
+		if err = json.Cjson.Unmarshal(body, &wireParams); err != nil {
+			return err
+		}
+		wireSignature, _ := wireParams["signature"].(string)
+		rawSignature, err := hex.DecodeString(wireSignature)
+		if err != nil {
+			return fmt.Errorf("gmpay notify signature is not hex: %w", err)
+		}
+		canonical, err := sign.Canonical(wireParams)
+		if err != nil {
+			return err
+		}
+		if !ed25519.Verify(pub, []byte(canonical), rawSignature) {
+			return errors.New("gmpay notify signature does not cover the bytes being sent")
+		}
+
+		resp, err := http_client.GetHttpClient().R().
 			SetHeader("powered-by", "Epusdt(https://github.com/GMwalletApp/epusdt)").
-			SetBody(orderResp).
+			SetHeader("Content-Type", "application/json").
+			SetBody(body).
 			Post(order.NotifyUrl)
 		if err != nil {
 			return err

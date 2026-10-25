@@ -99,6 +99,10 @@ func main() {
 	defer func() {
 		if err := recover(); err != nil {
 			color.Error.Println("[Start Server Err!!!] ", err)
+			// A recovered startup panic means the server never started. Exiting 0
+			// would look like a clean shutdown to the supervisor (Restart=always)
+			// and hide the failure; always exit non-zero.
+			os.Exit(1)
 		}
 	}()
 	if err := command.Execute(); err != nil {

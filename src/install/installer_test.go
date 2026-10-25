@@ -1,6 +1,7 @@
 package install
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -13,8 +14,12 @@ import (
 	"github.com/GMWalletApp/epusdt/config"
 	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/data"
+	appLog "github.com/GMWalletApp/epusdt/util/log"
 	"github.com/labstack/echo/v4"
 	"github.com/spf13/viper"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func resetInstallTestState(t *testing.T) {
@@ -72,6 +77,19 @@ func assertDoneClosed(t *testing.T, done <-chan struct{}) {
 
 func changeInstalledAdminPassword(t *testing.T, envPath, newPassword string) {
 	t.Helper()
+
+	// §8.1: the operator writes the GMPay keys right after install; config.Init is
+	// fail-closed without them, so reopening a freshly installed .env needs them.
+	envContent, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("read installed env: %v", err)
+	}
+	envContent = append(bytes.TrimRight(envContent, "\n"),
+		"\ngmpay_signing_key=6c1c7d4d6f2a4a3c8f8f1b0f3f9e2a5d4c6b7a8e9f0a1b2c3d4e5f60718293a4\n"+
+			"gmpay_reconcile_key=test-reconcile-key-0123456789abcdef\n"...)
+	if err := os.WriteFile(envPath, envContent, 0o600); err != nil {
+		t.Fatalf("write installed env: %v", err)
+	}
 
 	if err := initInstallConfig(envPath); err != nil {
 		t.Fatalf("reopen install config: %v", err)
@@ -381,5 +399,323 @@ func TestInstallAPISubmitInvalidPort(t *testing.T) {
 	}
 	if _, err := os.Stat(envPath); err == nil {
 		t.Error("env file should not have been written for invalid port")
+	}
+}
+
+// envKeyCounts counts how many times each key appears in a .env file. It parses
+// the file independently of the production parser so the assertions below check
+// the written file, not the code that wrote it.
+func envKeyCounts(content string) map[string]int {
+	counts := make(map[string]int)
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, _, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		counts[strings.TrimSpace(key)]++
+	}
+	return counts
+}
+
+func readEnvFileString(t *testing.T, path string) string {
+	t.Helper()
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(content)
+}
+
+func envBackupPaths(t *testing.T, envPath string) []string {
+	t.Helper()
+
+	backups, err := filepath.Glob(envPath + ".bak.*")
+	if err != nil {
+		t.Fatalf("glob env backups: %v", err)
+	}
+	return backups
+}
+
+func newReinstallRequest() *InstallRequest {
+	return &InstallRequest{
+		AppName:             "newapp",
+		AppURI:              "https://new.example.com",
+		HttpBindAddr:        "0.0.0.0",
+		HttpBindPort:        9000,
+		RuntimeRootPath:     "./runtime",
+		LogSavePath:         "./logs",
+		OrderExpirationTime: 10,
+		OrderNoticeMaxRetry: 8,
+	}
+}
+
+// TestWriteEnvFileKeepsKeysOutsideTheTemplate covers the real outage: a re-install
+// must not drop .env keys the install form does not know about (gmpay_*, mysql_*,
+// tg_*), because dropping mysql_* makes the service fail to start and dropping
+// gmpay_signing_key makes startup fail closed.
+func TestWriteEnvFileKeepsKeysOutsideTheTemplate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+
+	const signingKey = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
+	oldEnv := `app_name=oldapp
+app_uri=http://old.example.com:8000
+db_type=mysql
+mysql_host=127.0.0.1
+mysql_port=3306
+mysql_user=epusdt
+mysql_passwd=s3cret
+tg_bot_token=123:abc
+tg_manage=42
+gmpay_signing_key=` + signingKey + `
+gmpay_reconcile_key=reconcile-key-with-at-least-32-characters
+order_expiration_time=10
+order_notice_max_retry=8
+`
+	if err := os.WriteFile(path, []byte(oldEnv), 0o600); err != nil {
+		t.Fatalf("write existing env: %v", err)
+	}
+
+	if err := writeEnvFile(path, newReinstallRequest(), false); err != nil {
+		t.Fatalf("writeEnvFile: %v", err)
+	}
+	content := readEnvFileString(t, path)
+
+	// Every key of the rewritten file must appear exactly once, including the
+	// keys appended from the old file and the two preserved order_* keys.
+	for key, n := range envKeyCounts(content) {
+		if n != 1 {
+			t.Errorf("key %q appears %d times in rewritten env, want exactly once\ncontent:\n%s", key, n, content)
+		}
+	}
+	for _, key := range []string{
+		"gmpay_signing_key", "gmpay_reconcile_key", "db_type",
+		"mysql_host", "mysql_port", "mysql_user", "mysql_passwd",
+		"tg_bot_token", "tg_manage",
+		"order_expiration_time", "order_notice_max_retry",
+	} {
+		if n := envKeyCounts(content)[key]; n != 1 {
+			t.Errorf("key %q appears %d times in rewritten env, want exactly once\ncontent:\n%s", key, n, content)
+		}
+	}
+	for _, want := range []string{
+		"gmpay_signing_key=" + signingKey,
+		"gmpay_reconcile_key=reconcile-key-with-at-least-32-characters",
+		"db_type=mysql",
+		"mysql_host=127.0.0.1",
+		"mysql_port=3306",
+		"mysql_user=epusdt",
+		"mysql_passwd=s3cret",
+		"tg_bot_token=123:abc",
+		"tg_manage=42",
+		"order_notice_max_retry=8",
+		// form-controlled keys still follow the submitted form
+		"app_name=newapp",
+		"app_uri=https://new.example.com",
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("rewritten env missing %q\ncontent:\n%s", want, content)
+		}
+	}
+}
+
+// TestWriteEnvFileModeOnlyGetsTighter covers the permission contract: the rewrite
+// and its backup must never end up more permissive than owner-only, and an
+// already tight mode (0400) survives a rewrite instead of being normalized to 0600.
+func TestWriteEnvFileModeOnlyGetsTighter(t *testing.T) {
+	tests := []struct {
+		name       string
+		oldMode    os.FileMode
+		exists     bool
+		wantMode   os.FileMode
+		wantBackup bool
+	}{
+		{name: "first install", exists: false, wantMode: 0o600},
+		{name: "owner read only is kept", oldMode: 0o400, exists: true, wantMode: 0o400, wantBackup: true},
+		{name: "world readable is tightened", oldMode: 0o644, exists: true, wantMode: 0o600, wantBackup: true},
+		{name: "group readable is tightened", oldMode: 0o640, exists: true, wantMode: 0o600, wantBackup: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, ".env")
+			const oldContent = "db_type=mysql\ngmpay_signing_key=deadbeef\n"
+			if tc.exists {
+				if err := os.WriteFile(path, []byte(oldContent), tc.oldMode); err != nil {
+					t.Fatalf("write existing env: %v", err)
+				}
+				if err := os.Chmod(path, tc.oldMode); err != nil {
+					t.Fatalf("chmod existing env: %v", err)
+				}
+			}
+
+			if err := writeEnvFile(path, newReinstallRequest(), false); err != nil {
+				t.Fatalf("writeEnvFile: %v", err)
+			}
+
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatalf("stat rewritten env: %v", err)
+			}
+			if got := info.Mode().Perm(); got != tc.wantMode {
+				t.Fatalf("env mode = %o, want %o", got, tc.wantMode)
+			}
+
+			backups := envBackupPaths(t, path)
+			if !tc.wantBackup {
+				if len(backups) != 0 {
+					t.Fatalf("first install must not create a backup, got %v", backups)
+				}
+				return
+			}
+			if len(backups) != 1 {
+				t.Fatalf("backup files = %v, want exactly one", backups)
+			}
+			backupInfo, err := os.Stat(backups[0])
+			if err != nil {
+				t.Fatalf("stat backup: %v", err)
+			}
+			if got := backupInfo.Mode().Perm(); got != tc.wantMode {
+				t.Errorf("backup mode = %o, want %o (a backup must not be wider than the env)", got, tc.wantMode)
+			}
+			if got := backupInfo.Mode().Perm(); got&0o077 != 0 {
+				t.Errorf("backup mode %o is group/other accessible", got)
+			}
+			if got := readEnvFileString(t, backups[0]); got != oldContent {
+				t.Errorf("backup content = %q, want %q", got, oldContent)
+			}
+		})
+	}
+}
+
+// TestWriteEnvFileKeepsOneBackup pins the retention rule: every rewrite adds a
+// .env.bak.<ts> copy, so repeated installs must not accumulate readable copies of
+// the signing key.
+func TestWriteEnvFileKeepsOneBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	if err := os.WriteFile(path, []byte("gmpay_signing_key=deadbeef\n"), 0o600); err != nil {
+		t.Fatalf("write existing env: %v", err)
+	}
+
+	for range 3 {
+		if err := writeEnvFile(path, newReinstallRequest(), false); err != nil {
+			t.Fatalf("writeEnvFile: %v", err)
+		}
+	}
+
+	backups := envBackupPaths(t, path)
+	if len(backups) != 1 {
+		t.Fatalf("backup files = %v, want exactly one", backups)
+	}
+}
+
+// TestWriteEnvFileWarnsWhenEnvValueWins covers the fail-safe for the two keys that
+// were removed from formControlledKeys: the .env value is kept, and the ignored
+// form value is reported instead of being dropped silently.
+func TestWriteEnvFileWarnsWhenEnvValueWins(t *testing.T) {
+	core, logs := observer.New(zapcore.WarnLevel)
+	previousSugar := appLog.Sugar
+	appLog.Sugar = zap.New(core).Sugar()
+	t.Cleanup(func() { appLog.Sugar = previousSugar })
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	if err := os.WriteFile(path, []byte("order_notice_max_retry=8\norder_expiration_time=30\n"), 0o600); err != nil {
+		t.Fatalf("write existing env: %v", err)
+	}
+
+	req := newReinstallRequest()
+	req.OrderNoticeMaxRetry = 5
+	req.OrderExpirationTime = 10
+	if err := writeEnvFile(path, req, false); err != nil {
+		t.Fatalf("writeEnvFile: %v", err)
+	}
+
+	content := readEnvFileString(t, path)
+	counts := envKeyCounts(content)
+	if counts["order_notice_max_retry"] != 1 || counts["order_expiration_time"] != 1 {
+		t.Fatalf("order keys must appear exactly once, got counts=%v\ncontent:\n%s", counts, content)
+	}
+	if !strings.Contains(content, "order_notice_max_retry=8") {
+		t.Errorf("env value order_notice_max_retry=8 was not preserved\ncontent:\n%s", content)
+	}
+	if strings.Contains(content, "order_notice_max_retry=5") {
+		t.Errorf("form value order_notice_max_retry=5 leaked into the env\ncontent:\n%s", content)
+	}
+	if !strings.Contains(content, "order_expiration_time=30") {
+		t.Errorf("env value order_expiration_time=30 was not preserved\ncontent:\n%s", content)
+	}
+
+	entries := logs.All()
+	if len(entries) != 2 {
+		t.Fatalf("warnings = %v, want exactly two (one per ignored form value)", entries)
+	}
+	for _, entry := range entries {
+		if entry.Level != zapcore.WarnLevel {
+			t.Errorf("log level = %v, want warn", entry.Level)
+		}
+	}
+	for _, want := range []struct {
+		message string
+		parts   []string
+	}{
+		{
+			message: "order_notice_max_retry",
+			parts:   []string{"form value order_notice_max_retry=5 ignored", "effective value order_notice_max_retry=8 comes from .env"},
+		},
+		{
+			message: "order_expiration_time",
+			parts:   []string{"form value order_expiration_time=10 ignored", "effective value order_expiration_time=30 comes from .env"},
+		},
+	} {
+		found := false
+		for _, entry := range entries {
+			if !strings.Contains(entry.Message, want.message) {
+				continue
+			}
+			found = true
+			for _, part := range want.parts {
+				if !strings.Contains(entry.Message, part) {
+					t.Errorf("warning %q missing %q", entry.Message, part)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("no warning mentioned %q; warnings: %v", want.message, entries)
+		}
+	}
+}
+
+// TestWriteEnvFileRefusesDuplicateKey covers the pre-rename self check: a form
+// value that would inject a second line for an existing key must abort the write
+// and leave the current .env untouched.
+func TestWriteEnvFileRefusesDuplicateKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	const oldContent = "db_type=mysql\ngmpay_signing_key=deadbeef\n"
+	if err := os.WriteFile(path, []byte(oldContent), 0o600); err != nil {
+		t.Fatalf("write existing env: %v", err)
+	}
+
+	req := newReinstallRequest()
+	req.AppName = "evil\napp_name=duplicate"
+	if err := writeEnvFile(path, req, false); err == nil {
+		t.Fatal("writeEnvFile accepted a form value that duplicates a key")
+	}
+
+	if got := readEnvFileString(t, path); got != oldContent {
+		t.Fatalf("env file was replaced despite a failed self check, got:\n%s", got)
+	}
+	if temps, err := filepath.Glob(filepath.Join(dir, ".env.tmp.*")); err != nil {
+		t.Fatalf("glob temp files: %v", err)
+	} else if len(temps) != 0 {
+		t.Fatalf("temp file left behind after failed self check: %v", temps)
 	}
 }

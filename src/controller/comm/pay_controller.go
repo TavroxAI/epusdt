@@ -32,6 +32,31 @@ func (c *BaseCommController) CheckoutCounter(ctx echo.Context) (err error) {
 	return c.SucJson(ctx, resp)
 }
 
+// GetOrderByOrderId 按商户单号查询订单签名快照（对账专用）
+// @Summary      Get order by order id (signed snapshot)
+// @Description  Authenticated, signed order lookup for merchant reconciliation. The request itself is signed with the static instance-level reconcile key (gmpay_reconcile_key): lowercase hex HMAC-SHA256 over the canonical order_id/pid/ts payload, and ts (Unix seconds) must be within 300 seconds of the server clock. pid and ts are audit fields only and never scope the lookup. Any authentication failure is HTTP 401 with status_code=401 so it can never be mistaken for a missing order.
+// @Description  The returned snapshot is the checkout-counter body plus order_id, pid, block_transaction_id and an Ed25519 signature over the canonical body (sign_type=ed25519, key_id identifies the signing key). The endpoint sends Cache-Control: no-store.
+// @Description  A missing order is 10008; an order whose api_key row is gone is 10045. The two must not be conflated: 10008 may be counted as "order not found", 10045 belongs to pull failures.
+// @Tags         Payment
+// @Produce      json
+// @Param        order_id path string true "Merchant order id (order_id)"
+// @Param        pid query string true "API key pid (audit only)"
+// @Param        ts query integer true "Unix seconds; must be within 300s of server time"
+// @Param        signature query string true "Lowercase hex HMAC-SHA256 of the canonical order_id/pid/ts payload"
+// @Success      200 {object} response.ApiResponse{data=response.CheckoutCounterResponse}
+// @Failure      400 {object} response.ApiResponse "Stable errno in status_code: 10008 order not found, 10045 order api key unavailable"
+// @Failure      401 {object} response.ApiResponse "Reconcile signature rejected (status_code=401)"
+// @Router       /payments/gmpay/v1/orders/by-order-id/{order_id} [get]
+func (c *BaseCommController) GetOrderByOrderId(ctx echo.Context) error {
+	// A signed order snapshot must never be cached by a browser or proxy.
+	ctx.Response().Header().Set("Cache-Control", "no-store")
+	resp, err := service.GetOrderSnapshotByOrderId(ctx.Param("order_id"))
+	if err != nil {
+		return c.FailJson(ctx, err)
+	}
+	return c.SucJson(ctx, resp)
+}
+
 // ReturnToMerchant performs the browser-facing EPay success return hop.
 // Non-EPay or not-yet-paid orders are sent back to the checkout counter.
 // @Summary      Return to merchant (EPAY compat)

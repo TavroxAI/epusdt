@@ -1,6 +1,7 @@
 package task
 
 import (
+	"github.com/GMWalletApp/epusdt/model/mdb"
 	"github.com/GMWalletApp/epusdt/util/log"
 	"github.com/robfig/cron/v3"
 )
@@ -13,6 +14,11 @@ func Start() {
 	go StartBscWebSocketListener()
 	go StartPolygonWebSocketListener()
 	go StartPlasmaWebSocketListener()
+	// Native coins emit no logs, so they need their own block scanner. It stays
+	// idle until a native chain_tokens row (ethereum/ETH, binance/BNB) is enabled.
+	go StartEvmNativeScanner(mdb.NetworkEthereum, "[ETH-NATIVE]")
+	go StartEvmNativeScanner(mdb.NetworkBsc, "[BNB-NATIVE]")
+
 	go StartEthereumBackfillScannerListener()
 	go StartBscBackfillScannerListener()
 	go StartPolygonBackfillScannerListener()

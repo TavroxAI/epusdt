@@ -2,7 +2,9 @@ package testutil
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/GMWalletApp/epusdt/config"
@@ -143,6 +145,11 @@ func SetupTestDatabases(t testing.TB) func() {
 		t.Fatalf("seed rate.forced_rate_list: %v", err)
 	}
 
+	// Create-order responses are signed, and settlement-critical helpers are
+	// fail-closed without a key, so every DB-based test needs signing material.
+	// Loaded once per process: a package that installs its own seed keeps it.
+	installGMPayTestKeys(t)
+
 	return func() {
 		closeDB(t, runtimeDB)
 		closeDB(t, mainDB)
@@ -155,6 +162,37 @@ func SetupTestDatabases(t testing.TB) func() {
 		config.ResetRateCacheRuntime()
 		viper.Reset()
 	}
+}
+
+// GMPayTestSigningSeed is the fixed Ed25519 seed the shared test fixture loads.
+// Tests that need the matching public key derive it from this value.
+const GMPayTestSigningSeed = "6c1c7d4d6f2a4a3c8f8f1b0f3f9e2a5d4c6b7a8e9f0a1b2c3d4e5f60718293a4"
+
+// GMPayTestReconcileKey is the reconcile key of the shared test fixture.
+const GMPayTestReconcileKey = "test-reconcile-key-0123456789abcdef"
+
+// installGMPayTestKeys loads the GMPay signing material through config.Init,
+// which is the only path that populates it. It is a no-op when a key is already
+// loaded, so packages that install their own seed (and assert against it) are
+// not overridden.
+func installGMPayTestKeys(t testing.TB) {
+	t.Helper()
+
+	if _, err := config.GetGMPaySigningKey(); err == nil {
+		return
+	}
+	envPath := filepath.Join(t.TempDir(), ".env")
+	content := strings.Join([]string{
+		"log_level=error",
+		"gmpay_signing_key=" + GMPayTestSigningSeed,
+		"gmpay_reconcile_key=" + GMPayTestReconcileKey,
+	}, "\n")
+	if err := os.WriteFile(envPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write test GMPay config: %v", err)
+	}
+	config.SetConfigPath(envPath)
+	t.Cleanup(func() { config.SetConfigPath("") })
+	config.Init()
 }
 
 func testRateCacheSnapshot(row mdb.RateCache) config.RateCacheSnapshot {

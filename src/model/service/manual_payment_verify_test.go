@@ -828,6 +828,8 @@ func TestManualVerifySolanaRejectsMissingBlockTime(t *testing.T) {
 type fakeEvmReader struct {
 	receipt    *types.Receipt
 	receiptErr error
+	tx         *types.Transaction
+	txErr      error
 	headers    map[string]*types.Header
 	headerErr  error
 }
@@ -837,6 +839,13 @@ func (f *fakeEvmReader) TransactionReceipt(context.Context, common.Hash) (*types
 		return nil, f.receiptErr
 	}
 	return f.receipt, nil
+}
+
+func (f *fakeEvmReader) TransactionByHash(context.Context, common.Hash) (*types.Transaction, bool, error) {
+	if f.txErr != nil {
+		return nil, false, f.txErr
+	}
+	return f.tx, false, nil
 }
 
 func (f *fakeEvmReader) HeaderByNumber(_ context.Context, number *big.Int) (*types.Header, error) {
