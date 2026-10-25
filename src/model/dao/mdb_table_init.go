@@ -94,6 +94,13 @@ func seedChainTokens() {
 		// Ethereum
 		{Network: mdb.NetworkEthereum, Symbol: "USDT", ContractAddress: "0xdAC17F958D2ee523a2206206994597C13D831ec7", Decimals: 6, Enabled: true},
 		{Network: mdb.NetworkEthereum, Symbol: "USDC", ContractAddress: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", Decimals: 6, Enabled: true},
+		// Native coins are the only contract-less row a chain accepts; they are
+		// scanned from block transactions instead of Transfer logs. They can only
+		// be priced when rates are learned automatically, so a fresh fixed-rate
+		// install starts with them off rather than showing a method that fails
+		// with "rate calculation failed" until the operator adds a per-coin rate.
+		{Network: mdb.NetworkEthereum, Symbol: "ETH", ContractAddress: "", Decimals: 18, Enabled: seedNativeTokenEnabled()},
+		{Network: mdb.NetworkBsc, Symbol: "BNB", ContractAddress: "", Decimals: 18, Enabled: seedNativeTokenEnabled()},
 		// Solana
 		{Network: mdb.NetworkSolana, Symbol: "USDT", ContractAddress: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", Decimals: 6, Enabled: true},
 		{Network: mdb.NetworkSolana, Symbol: "USDC", ContractAddress: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", Decimals: 6, Enabled: true},
@@ -116,6 +123,20 @@ func seedChainTokens() {
 	if err := Mdb.Clauses(clause.OnConflict{DoNothing: true}).Create(&defaults).Error; err != nil {
 		color.Red.Printf("[store_db] seed chain_tokens err=%s\n", err)
 	}
+}
+
+// seedNativeTokenEnabled decides the initial state of the native coin rows
+// (ETH, BNB). Only an install that prices coins automatically can take a native
+// payment out of the box; with the fixed-rate default the operator must add a
+// per-coin rate first, so the rows start disabled instead of advertising a
+// method whose create-order call fails with "rate calculation failed". Existing
+// rows are never re-enabled by the seed (ON CONFLICT DO NOTHING), so an admin's
+// choice always wins.
+func seedNativeTokenEnabled() bool {
+	if strings.EqualFold(strings.TrimSpace(defaultRateModeForSeed()), config.RateModeAuto) {
+		return true
+	}
+	return strings.TrimSpace(config.GetRateApiUrlFromEnv()) != ""
 }
 
 // seedRpcNodes inserts default RPC endpoints for each chain. Checks per

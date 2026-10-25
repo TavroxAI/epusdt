@@ -157,7 +157,7 @@ func TestSeedDefaultSettingsIncludesSystemLogLevel(t *testing.T) {
 	seedDefaultSettings()
 
 	var row mdb.Setting
-	if err := Mdb.Where("`key` = ?", mdb.SettingKeySystemLogLevel).Take(&row).Error; err != nil {
+	if err := Mdb.Where(map[string]any{"key": mdb.SettingKeySystemLogLevel}).Take(&row).Error; err != nil {
 		t.Fatalf("load system.log_level seed: %v", err)
 	}
 	if row.Group != mdb.SettingGroupSystem {
@@ -178,7 +178,7 @@ func TestSeedDefaultSettingsIncludesDefaultForcedRateList(t *testing.T) {
 	seedDefaultSettings()
 
 	var row mdb.Setting
-	if err := Mdb.Where("`key` = ?", mdb.SettingKeyRateForcedRateList).Take(&row).Error; err != nil {
+	if err := Mdb.Where(map[string]any{"key": mdb.SettingKeyRateForcedRateList}).Take(&row).Error; err != nil {
 		t.Fatalf("load rate.forced_rate_list seed: %v", err)
 	}
 	if row.Group != mdb.SettingGroupRate {
@@ -207,7 +207,7 @@ func TestSeedDefaultSettingsIncludesRateModeAndTTL(t *testing.T) {
 	}
 	for key, want := range wants {
 		var row mdb.Setting
-		if err := Mdb.Where("`key` = ?", key).Take(&row).Error; err != nil {
+		if err := Mdb.Where(map[string]any{"key": key}).Take(&row).Error; err != nil {
 			t.Fatalf("load %s seed: %v", key, err)
 		}
 		if row.Group != mdb.SettingGroupRate || row.Value != want.value || row.Type != want.valueType {
@@ -224,7 +224,7 @@ func TestSeedDefaultSettingsKeepsFreshInstallFixedWithConfiguredEnvAPI(t *testin
 	seedDefaultSettings()
 
 	var row mdb.Setting
-	if err := Mdb.Where("`key` = ?", mdb.SettingKeyRateMode).Take(&row).Error; err != nil {
+	if err := Mdb.Where(map[string]any{"key": mdb.SettingKeyRateMode}).Take(&row).Error; err != nil {
 		t.Fatalf("load fresh rate.mode seed: %v", err)
 	}
 	if row.Value != config.RateModeFixed {
@@ -246,7 +246,7 @@ func TestSeedDefaultSettingsMigratesLegacyExternalAPIInstallToAuto(t *testing.T)
 	seedDefaultSettings()
 
 	var row mdb.Setting
-	if err := Mdb.Where("`key` = ?", mdb.SettingKeyRateMode).Take(&row).Error; err != nil {
+	if err := Mdb.Where(map[string]any{"key": mdb.SettingKeyRateMode}).Take(&row).Error; err != nil {
 		t.Fatalf("load migrated rate.mode: %v", err)
 	}
 	if row.Value != config.RateModeAuto {
@@ -270,7 +270,7 @@ func TestSeedDefaultSettingsMigratesLegacyEnvAPIInstallToAuto(t *testing.T) {
 	seedDefaultSettings()
 
 	var row mdb.Setting
-	if err := Mdb.Where("`key` = ?", mdb.SettingKeyRateMode).Take(&row).Error; err != nil {
+	if err := Mdb.Where(map[string]any{"key": mdb.SettingKeyRateMode}).Take(&row).Error; err != nil {
 		t.Fatalf("load env-migrated rate.mode: %v", err)
 	}
 	if row.Value != config.RateModeAuto {
@@ -292,7 +292,7 @@ func TestSeedDefaultSettingsPreservesExplicitLegacyRateMode(t *testing.T) {
 	seedDefaultSettings()
 
 	var row mdb.Setting
-	if err := Mdb.Where("`key` = ?", mdb.SettingKeyRateMode).Take(&row).Error; err != nil {
+	if err := Mdb.Where(map[string]any{"key": mdb.SettingKeyRateMode}).Take(&row).Error; err != nil {
 		t.Fatalf("load explicit rate.mode: %v", err)
 	}
 	if row.Value != config.RateModeFixed {
@@ -313,7 +313,7 @@ func TestSeedDefaultSettingsUsesEmptyEpayTokenAndNetwork(t *testing.T) {
 		mdb.SettingKeyEpayDefaultNetwork,
 	} {
 		var row mdb.Setting
-		if err := Mdb.Where("`key` = ?", key).Take(&row).Error; err != nil {
+		if err := Mdb.Where(map[string]any{"key": key}).Take(&row).Error; err != nil {
 			t.Fatalf("load %s seed: %v", key, err)
 		}
 		rows[key] = row
@@ -348,7 +348,7 @@ func TestSeedDefaultSettingsDoesNotOverwriteExistingEpayDefaults(t *testing.T) {
 		mdb.SettingKeyEpayDefaultNetwork: "tron",
 	} {
 		var row mdb.Setting
-		if err := Mdb.Where("`key` = ?", key).Take(&row).Error; err != nil {
+		if err := Mdb.Where(map[string]any{"key": key}).Take(&row).Error; err != nil {
 			t.Fatalf("load %s seed: %v", key, err)
 		}
 		if row.Value != want {
@@ -372,7 +372,7 @@ func TestSeedDefaultSettingsDoesNotOverwriteSystemLogLevel(t *testing.T) {
 	seedDefaultSettings()
 
 	var row mdb.Setting
-	if err := Mdb.Where("`key` = ?", mdb.SettingKeySystemLogLevel).Take(&row).Error; err != nil {
+	if err := Mdb.Where(map[string]any{"key": mdb.SettingKeySystemLogLevel}).Take(&row).Error; err != nil {
 		t.Fatalf("load system.log_level seed: %v", err)
 	}
 	if row.Value != "debug" {
@@ -414,4 +414,42 @@ func setupSeedTableTestDB(t *testing.T, models ...interface{}) *gorm.DB {
 		t.Fatalf("migrate seed table: %v", err)
 	}
 	return db
+}
+
+// TestSeedChainTokensIncludesNativeCoins pins the built-in native rows: they are
+// what lets an upgraded install offer ETH/BNB without the console's add-token
+// dialog, and their initial enabled state follows whether coins can be priced.
+func TestSeedChainTokensIncludesNativeCoins(t *testing.T) {
+	db := setupSeedTableTestDB(t, &mdb.ChainToken{})
+	Mdb = db
+
+	seedChainTokens()
+
+	for _, key := range []string{mdb.NetworkEthereum + "/ETH", mdb.NetworkBsc + "/BNB"} {
+		parts := strings.Split(key, "/")
+		var row mdb.ChainToken
+		if err := Mdb.Where("network = ? AND symbol = ?", parts[0], parts[1]).Take(&row).Error; err != nil {
+			t.Fatalf("load native token seed %s: %v", key, err)
+		}
+		if strings.TrimSpace(row.ContractAddress) != "" {
+			t.Fatalf("%s contract_address = %q, want empty", key, row.ContractAddress)
+		}
+		if row.Decimals != 18 {
+			t.Fatalf("%s decimals = %d, want 18", key, row.Decimals)
+		}
+	}
+
+	// Re-running the seed must keep an admin's edit instead of re-enabling the row.
+	patch := mdb.ChainToken{Enabled: true}
+	if err := Mdb.Model(&mdb.ChainToken{}).Where("network = ? AND symbol = ?", mdb.NetworkEthereum, "ETH").Updates(patch).Error; err != nil {
+		t.Fatalf("enable ETH: %v", err)
+	}
+	seedChainTokens()
+	var enabled mdb.ChainToken
+	if err := Mdb.Where("network = ? AND symbol = ?", mdb.NetworkEthereum, "ETH").Take(&enabled).Error; err != nil {
+		t.Fatalf("reload ETH: %v", err)
+	}
+	if !enabled.Enabled {
+		t.Fatal("seed re-disabled an admin-enabled native row")
+	}
 }
