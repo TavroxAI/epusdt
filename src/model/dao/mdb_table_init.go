@@ -123,6 +123,22 @@ func seedChainTokens() {
 	if err := Mdb.Clauses(clause.OnConflict{DoNothing: true}).Create(&defaults).Error; err != nil {
 		color.Red.Printf("[store_db] seed chain_tokens err=%s\n", err)
 	}
+	// The (network, symbol) unique index also covers soft-deleted rows, so the
+	// insert above silently skips a coin someone once deleted: the row still
+	// occupies the index while staying invisible in every list. Native coins are
+	// seed data and must not disappear that way, so unhide them here. Only
+	// deleted_at is cleared; the operator's enabled / contract_address /
+	// decimals values are left exactly as they are.
+	for _, native := range [][2]string{
+		{mdb.NetworkEthereum, "ETH"},
+		{mdb.NetworkBsc, "BNB"},
+	} {
+		if err := Mdb.Unscoped().Model(&mdb.ChainToken{}).
+			Where("network = ? AND symbol = ? AND deleted_at IS NOT NULL", native[0], native[1]).
+			Update("deleted_at", nil).Error; err != nil {
+			color.Red.Printf("[store_db] revive native token %s/%s err=%s\n", native[0], native[1], err)
+		}
+	}
 }
 
 // seedNativeTokenEnabled decides the initial state of the native coin rows

@@ -452,4 +452,22 @@ func TestSeedChainTokensIncludesNativeCoins(t *testing.T) {
 	if !enabled.Enabled {
 		t.Fatal("seed re-disabled an admin-enabled native row")
 	}
+
+	// A soft-deleted row keeps the (network, symbol) unique index occupied while
+	// staying invisible in every list, so the seed has to unhide it or the coin
+	// would never come back.
+	if err := Mdb.Where("network = ? AND symbol = ?", mdb.NetworkEthereum, "ETH").Delete(&mdb.ChainToken{}).Error; err != nil {
+		t.Fatalf("soft delete ETH: %v", err)
+	}
+	if err := Mdb.Where("network = ? AND symbol = ?", mdb.NetworkEthereum, "ETH").Take(&mdb.ChainToken{}).Error; err == nil {
+		t.Fatal("soft-deleted ETH is still visible to normal queries")
+	}
+	seedChainTokens()
+	var revived mdb.ChainToken
+	if err := Mdb.Where("network = ? AND symbol = ?", mdb.NetworkEthereum, "ETH").Take(&revived).Error; err != nil {
+		t.Fatalf("seed did not revive the soft-deleted ETH row: %v", err)
+	}
+	if !revived.Enabled {
+		t.Fatal("revived ETH row lost its enabled state")
+	}
 }
