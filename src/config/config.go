@@ -2,6 +2,7 @@ package config
 
 import (
 	"crypto/ed25519"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -106,6 +107,13 @@ func loadGMPayKeys() {
 	}
 	gmpaySigningKey = signingKey
 	gmpayReconcileKey = reconcileKey
+
+	// Print the public half once at startup: the merchant connector needs exactly
+	// this value, and it cannot be derived from the seed by hand.
+	if pub, ok := signingKey.Public().(ed25519.PublicKey); ok {
+		fmt.Printf("[gmpay] signing public key=%s key_id=%s (configure this as the merchant's Epusdt public key)\n",
+			hex.EncodeToString(pub), sign.KeyIDFor(pub))
+	}
 }
 
 // GetGMPaySigningKey returns the configured Ed25519 private key.
