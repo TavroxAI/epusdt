@@ -50,21 +50,18 @@ func MdbTableInit() {
 		}
 		var failed []string
 		for _, m := range migrations {
+			// Existing tables are not re-migrated. gorm's PostgreSQL column sync
+			// queries information_schema.columns through the driver's simple
+			// protocol path, which on some servers fails with "insufficient
+			// arguments" for every model; the failure never helped those installs
+			// (their schema was created by an earlier version) and it used to abort
+			// the seeds below. Missing tables are still created here, which is what
+			// a fresh install needs.
+			if Mdb.Migrator().HasTable(m.model) {
+				continue
+			}
 			if err := Mdb.AutoMigrate(m.model); err != nil {
-				// A failed ALTER on one table used to abort the whole init, which
-				// silently skipped every seed below it: the console then showed a
-				// token list without the built-in coins and no line explained why.
-				// Keep going and report the failures once the seeds are done.
-				color.Red.Printf("[store_db] AutoMigrate DB(%s),err=%s\n", m.name, err)
-				// The error alone (e.g. pgx "insufficient arguments") does not say
-				// which statement failed, so replay this model once with SQL logging
-				// on: the failing statement then lands in the same journal.
-				color.Red.Printf("[store_db] replaying AutoMigrate DB(%s) with SQL logging to capture the failing statement\n", m.name)
-				if replayErr := Mdb.Debug().AutoMigrate(m.model); replayErr == nil {
-					// The replay fixed whatever was wrong; do not report it as failed.
-					color.Cyan.Printf("[store_db] AutoMigrate DB(%s) succeeded on replay\n", m.name)
-					continue
-				}
+				color.Red.Printf("[store_db] create table DB(%s) err=%s\n", m.name, err)
 				failed = append(failed, m.name)
 			}
 		}
