@@ -2,12 +2,14 @@ package notify
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/GMWalletApp/epusdt/util/security"
 	tb "gopkg.in/telebot.v3"
 )
 
@@ -48,13 +50,25 @@ func getOrCreateBot(cfg *TelegramConfig) (*tb.Bot, error) {
 	}
 	bot, err := tb.NewBot(settings)
 	if err != nil {
-		return nil, err
+		return nil, redactToken(err, cfg.BotToken)
 	}
 
 	botCacheMu.Lock()
 	botCache[cfg.BotToken] = bot
 	botCacheMu.Unlock()
 	return bot, nil
+}
+
+// redactToken removes the bot token from a client-library error.
+//
+// The Telegram Bot API path contains the token, so a transport-level failure
+// quotes a working credential; notify.Dispatch logs sender errors verbatim, which
+// used to write the token into the application log on every failed delivery.
+func redactToken(err error, botToken string) error {
+	if err == nil {
+		return nil
+	}
+	return errors.New(security.Redact(err.Error(), botToken))
 }
 
 // ParseTelegramConfig decodes telegram channel config and supports
@@ -143,5 +157,5 @@ func sendTelegram(configJSON, text string) error {
 		return err
 	}
 	_, err = bot.Send(&tb.User{ID: cfg.ChatID}, text, &tb.SendOptions{ParseMode: tb.ModeHTML})
-	return err
+	return redactToken(err, cfg.BotToken)
 }

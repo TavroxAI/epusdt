@@ -209,7 +209,7 @@ func sendOrderCallback(order *mdb.Orders) error {
 			return err
 		}
 
-		epayResp, err := http_client.GetHttpClient().R().SetQueryParams(formData).Get(order.NotifyUrl)
+		epayResp, err := http_client.GetCallbackClient().R().SetQueryParams(formData).Get(order.NotifyUrl)
 		if err != nil {
 			return err
 		}
@@ -290,7 +290,7 @@ func sendOrderCallback(order *mdb.Orders) error {
 			return errors.New("gmpay notify signature does not cover the bytes being sent")
 		}
 
-		resp, err := http_client.GetHttpClient().R().
+		resp, err := http_client.GetCallbackClient().R().
 			SetHeader("powered-by", "Epusdt(https://github.com/GMwalletApp/epusdt)").
 			SetHeader("Content-Type", "application/json").
 			SetBody(body).

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/GMWalletApp/epusdt/internal/testutil"
+	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
 	appjwt "github.com/GMWalletApp/epusdt/util/jwt"
@@ -65,54 +66,99 @@ func TestAdminTokenFromAuthorization(t *testing.T) {
 	}
 }
 
-func TestCheckAdminJWTAcceptsBearerAndBareTokens(t *testing.T) {
+func seedAdminUser(t *testing.T, status int) *mdb.AdminUser {
+	t.Helper()
+
+	hash, err := data.HashPassword("test-admin-pass-123")
+	if err != nil {
+		t.Fatalf("hash password: %v", err)
+	}
+	user := &mdb.AdminUser{
+		Username:     "admin",
+		PasswordHash: hash,
+		Status:       status,
+	}
+	if err := dao.Mdb.Create(user).Error; err != nil {
+		t.Fatalf("create admin user: %v", err)
+	}
+	return user
+}
+
+func newAdminJWTRouter() *echo.Echo {
+	e := echo.New()
+	e.Use(CheckAdminJWT())
+	e.GET("/", func(ctx echo.Context) error {
+		return ctx.NoContent(http.StatusNoContent)
+	})
+	return e
+}
+
+func serveAdminJWTRequest(e *echo.Echo, header string) int {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set(echo.HeaderAuthorization, header)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	return rec.Code
+}
+
+func TestCheckAdminJWTRequiresLiveAccount(t *testing.T) {
 	cleanup := testutil.SetupTestDatabases(t)
 	defer cleanup()
 
 	if err := data.SetSetting(mdb.SettingGroupSystem, mdb.SettingKeyJwtSecret, "test-jwt-secret", mdb.SettingTypeString); err != nil {
 		t.Fatalf("seed jwt secret: %v", err)
 	}
-	token, err := appjwt.Sign(42, "admin")
+	user := seedAdminUser(t, mdb.AdminUserStatusEnable)
+
+	token, err := appjwt.Sign(user.ID, user.Username, user.SessionVersion)
 	if err != nil {
 		t.Fatalf("sign jwt: %v", err)
 	}
+	e := newAdminJWTRouter()
 
-	tests := []struct {
-		name   string
-		header string
-	}{
-		{
-			name:   "bearer token",
-			header: "Bearer " + token,
-		},
-		{
-			name:   "bare token",
-			header: token,
-		},
+	for _, header := range []string{"Bearer " + token, token} {
+		if code := serveAdminJWTRequest(e, header); code != http.StatusNoContent {
+			t.Fatalf("valid token rejected: status=%d", code)
+		}
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			e := echo.New()
-			e.Use(CheckAdminJWT())
-			e.GET("/", func(ctx echo.Context) error {
-				if got := ctx.Get(AdminUserIDKey); got != uint64(42) {
-					t.Fatalf("%s = %v, want 42", AdminUserIDKey, got)
-				}
-				if got := ctx.Get(AdminUsernameKey); got != "admin" {
-					t.Fatalf("%s = %v, want admin", AdminUsernameKey, got)
-				}
-				return ctx.NoContent(http.StatusNoContent)
-			})
+	// Logout/password change bump the session version; the old token dies.
+	if err := data.BumpAdminSessionVersion(user.ID); err != nil {
+		t.Fatalf("bump session version: %v", err)
+	}
+	if code := serveAdminJWTRequest(e, "Bearer "+token); code != http.StatusUnauthorized {
+		t.Fatalf("token from a previous session accepted: status=%d", code)
+	}
 
-			req := httptest.NewRequest(http.MethodGet, "/", nil)
-			req.Header.Set(echo.HeaderAuthorization, tt.header)
-			rec := httptest.NewRecorder()
-			e.ServeHTTP(rec, req)
+	// A fresh login (new version) works again.
+	reloaded, err := data.GetAdminUserByID(user.ID)
+	if err != nil {
+		t.Fatalf("reload user: %v", err)
+	}
+	fresh, err := appjwt.Sign(reloaded.ID, reloaded.Username, reloaded.SessionVersion)
+	if err != nil {
+		t.Fatalf("sign fresh jwt: %v", err)
+	}
+	if code := serveAdminJWTRequest(e, "Bearer "+fresh); code != http.StatusNoContent {
+		t.Fatalf("fresh token rejected: status=%d", code)
+	}
 
-			if rec.Code != http.StatusNoContent {
-				t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusNoContent, rec.Body.String())
-			}
-		})
+	// Disabling the account revokes access without touching the token.
+	if err := dao.Mdb.Model(&mdb.AdminUser{}).Where("id = ?", user.ID).Update("status", mdb.AdminUserStatusDisable).Error; err != nil {
+		t.Fatalf("disable admin: %v", err)
+	}
+	if code := serveAdminJWTRequest(e, "Bearer "+fresh); code != http.StatusUnauthorized {
+		t.Fatalf("token for a disabled account accepted: status=%d", code)
+	}
+
+	// Deleting the account revokes access as well.
+	if err := dao.Mdb.Model(&mdb.AdminUser{}).Where("id = ?", user.ID).Update("status", mdb.AdminUserStatusEnable).Error; err != nil {
+		t.Fatalf("re-enable admin: %v", err)
+	}
+	if err := dao.Mdb.Delete(&mdb.AdminUser{}, user.ID).Error; err != nil {
+		t.Fatalf("delete admin: %v", err)
+	}
+	if code := serveAdminJWTRequest(e, "Bearer "+fresh); code != http.StatusUnauthorized {
+		t.Fatalf("token for a deleted account accepted: status=%d", code)
 	}
 }

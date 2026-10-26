@@ -100,3 +100,21 @@ docker compose up -d
 5. 配置独角兽后台
 
 商户密钥： http://your_domain/payments/epusdt/v1/order/create-transaction
+
+## 首次安装与反向代理注意事项
+
+- 首次运行的安装向导（`/install`）默认**只监听 `127.0.0.1:8000`**，因为它在安装完成前没有任何认证。官方镜像已显式设置 `EPUSDT_INSTALL_ADDR=:8000`，所以按上面的 compose 部署可以正常通过浏览器访问；如果自行构建镜像或裸机部署，需要通过环境变量显式放开：
+
+```shell
+EPUSDT_INSTALL_ADDR=:8000 ./epusdt http start
+```
+
+- 初始管理员密码**不再通过 HTTP 响应返回**，只在安装进程的控制台输出一次（`docker compose logs` 可见）。
+- 如果网关前面还有一层反向代理（nginx、CDN 等），为了让 API key 的 IP 白名单和后台登录限制拿到真实客户端地址，需要在 `.env` 里声明代理地址：
+
+```shell
+trusted_proxies=127.0.0.1,10.0.0.0/8
+```
+
+不配置时只采信来自回环 / 内网对端的 `X-Forwarded-For`、`X-Real-IP`，公网客户端自带的这类头会被忽略。
+

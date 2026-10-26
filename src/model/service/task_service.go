@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"html"
 	"math/big"
 	"strings"
 	"time"
@@ -372,6 +373,16 @@ func sendPaymentNotification(order *mdb.Orders) {
 		}
 	}
 
+	notify.Dispatch(mdb.NotifyEventPaySuccess, buildPaymentSuccessMessage(order))
+}
+
+// buildPaymentSuccessMessage renders the operator alert.
+//
+// The message is delivered with parse_mode=HTML and it is the operator's signal
+// to release goods, so every merchant-controlled value is escaped: an unescaped
+// order_id could inject a link, and markup Telegram cannot parse makes it reject
+// the whole message, silently losing the alert.
+func buildPaymentSuccessMessage(order *mdb.Orders) string {
 	precision := data.GetAmountPrecision()
 	amountFormat := fmt.Sprintf("%%.%df", precision)
 	msg := fmt.Sprintf(
@@ -388,17 +399,21 @@ func sendPaymentNotification(order *mdb.Orders) {
 			"├ 创建时间：%s\n"+
 			"└ 支付时间：%s",
 		order.Amount,
-		strings.ToUpper(order.Currency),
+		// The message is delivered with parse_mode=HTML and this alert is the
+		// operator's signal to release goods, so every merchant-controlled value is
+		// escaped: an unescaped order_id could inject a link, and unescaped markup
+		// makes Telegram reject the whole message, silently losing the alert.
+		html.EscapeString(strings.ToUpper(order.Currency)),
 		order.ActualAmount,
-		strings.ToUpper(order.Token),
-		order.TradeId,
-		order.OrderId,
-		networkDisplay(order.Network),
-		order.ReceiveAddress,
+		html.EscapeString(strings.ToUpper(order.Token)),
+		html.EscapeString(order.TradeId),
+		html.EscapeString(order.OrderId),
+		html.EscapeString(networkDisplay(order.Network)),
+		html.EscapeString(order.ReceiveAddress),
 		order.CreatedAt.ToDateTimeString(),
 		order.UpdatedAt.ToDateTimeString(),
 	)
-	notify.Dispatch(mdb.NotifyEventPaySuccess, msg)
+	return msg
 }
 
 func networkDisplay(n string) string {

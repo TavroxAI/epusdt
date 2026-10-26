@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/GMWalletApp/epusdt/config"
+	"github.com/GMWalletApp/epusdt/controller/admin"
 	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
@@ -41,6 +42,10 @@ const testAPIToken = "test-secret-token"
 
 func setupTestEnv(t *testing.T) *echo.Echo {
 	t.Helper()
+
+	// Login attempts are budgeted per client address; every test shares the same
+	// httptest address, so each test starts with a clean budget.
+	admin.ResetLoginAttemptsForTest()
 
 	tmpDir := t.TempDir()
 
@@ -274,6 +279,68 @@ func mustCreateEPayOrder(t *testing.T, e *echo.Echo, orderID string, returnURL s
 		t.Fatalf("expected checkout redirect, got %q", location)
 	}
 	return strings.TrimPrefix(location, "/pay/checkout-counter/")
+}
+
+// TestCreateOrderGmpayRejectsUnsafeRedirectURL closes the cashier XSS at the
+// boundary: a merchant-supplied javascript: redirect target must never be
+// stored, because the cashier assigns the stored value to window.location.href
+// in the same origin as the admin console.
+func TestCreateOrderGmpayRejectsUnsafeRedirectURL(t *testing.T) {
+	e := setupTestEnv(t)
+
+	for i, target := range []string{
+		"javascript:alert(document.cookie)",
+		"data:text/html,<script>alert(1)</script>",
+		"//evil.example/phish",
+	} {
+		t.Run(target, func(t *testing.T) {
+			body := signBody(map[string]interface{}{
+				"order_id":     fmt.Sprintf("test-unsafe-redirect-%d", i),
+				"amount":       1.00,
+				"token":        "usdt",
+				"currency":     "cny",
+				"network":      "solana",
+				"notify_url":   "https://93.184.216.34/notify",
+				"redirect_url": target,
+			})
+
+			rec := doPost(e, "/payments/gmpay/v1/order/create-transaction", body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+			}
+			var resp map[string]interface{}
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("unmarshal unsafe redirect response: %v", err)
+			}
+			if got := int(resp["status_code"].(float64)); got != 10044 {
+				t.Fatalf("status_code = %d, want 10044; response=%v", got, resp)
+			}
+			if got, _ := resp["message"].(string); got != constant.Errno[10044] {
+				t.Fatalf("message = %q, want %q", got, constant.Errno[10044])
+			}
+		})
+	}
+}
+
+// TestCreateOrderGmpayAcceptsPublicRedirectURL is the counter-test: the guard
+// must not reject a legitimate merchant return page.
+func TestCreateOrderGmpayAcceptsPublicRedirectURL(t *testing.T) {
+	e := setupTestEnv(t)
+
+	body := signBody(map[string]interface{}{
+		"order_id":     "test-public-redirect-001",
+		"amount":       1.00,
+		"token":        "usdt",
+		"currency":     "cny",
+		"network":      "solana",
+		"notify_url":   "https://93.184.216.34/notify",
+		"redirect_url": "https://merchant.example/return",
+	})
+
+	rec := doPost(e, "/payments/gmpay/v1/order/create-transaction", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestRootPostRoute(t *testing.T) {

@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/GMWalletApp/epusdt/model/data"
+	"github.com/GMWalletApp/epusdt/model/mdb"
 	appjwt "github.com/GMWalletApp/epusdt/util/jwt"
 	"github.com/labstack/echo/v4"
 )
@@ -16,9 +18,15 @@ const (
 	AdminUsernameKey = "admin_username"
 )
 
-// CheckAdminJWT validates an Authorization: Bearer <jwt> header against
-// the HS256 secret stored in system.jwt_secret. On success it injects
-// the admin user ID and username into the echo context.
+// CheckAdminJWT validates an Authorization: Bearer <jwt> header against the
+// HS256 secret stored in system.jwt_secret, then re-checks the account behind
+// the token.
+//
+// A valid signature alone is not authenticated: the user row must still exist,
+// the account must be enabled, and the token's stamped session version must
+// match the row's current one. That is what makes logout, password change,
+// disabling and deleting an admin take effect immediately instead of at token
+// expiry.
 //
 // Accepts both "Authorization: Bearer <jwt>" and a bare "<jwt>" for
 // developer convenience (curl / postman). The token itself is always
@@ -38,8 +46,17 @@ func CheckAdminJWT() echo.MiddlewareFunc {
 			if err != nil {
 				return echo.NewHTTPError(http.StatusUnauthorized, "invalid token")
 			}
-			ctx.Set(AdminUserIDKey, claims.AdminUserID)
-			ctx.Set(AdminUsernameKey, claims.Username)
+			user, err := data.GetAdminUserByID(claims.AdminUserID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "session lookup failed")
+			}
+			if user.ID == 0 ||
+				user.Status != mdb.AdminUserStatusEnable ||
+				user.SessionVersion != claims.SessionVersion {
+				return echo.NewHTTPError(http.StatusUnauthorized, "invalid token")
+			}
+			ctx.Set(AdminUserIDKey, user.ID)
+			ctx.Set(AdminUsernameKey, user.Username)
 			return next(ctx)
 		}
 	}

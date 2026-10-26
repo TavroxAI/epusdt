@@ -232,6 +232,7 @@ func TestAdminProtectedRoute_NoToken(t *testing.T) {
 	e := setupTestEnv(t)
 	protectedRoutes := []string{
 		"/admin/api/v1/auth/me",
+		"/admin/api/v1/auth/init-password-hash",
 		"/admin/api/v1/api-keys",
 		"/admin/api/v1/chains",
 		"/admin/api/v1/wallets",
@@ -269,12 +270,22 @@ func TestAdminMe(t *testing.T) {
 	}
 }
 
-// TestAdminLogout verifies the /auth/logout route succeeds with a valid token.
+// TestAdminLogout verifies /auth/logout revokes the calling token: the very same
+// token must be rejected afterwards, because a stateless JWT is only revocable
+// through the account's session version.
 func TestAdminLogout(t *testing.T) {
 	e, token := setupAdminTestEnv(t)
 	rec := doPostAdmin(e, "/admin/api/v1/auth/logout", nil, token)
 	t.Logf("Logout response: %s", rec.Body.String())
 	assertOK(t, rec)
+
+	recMe := doGetAdmin(e, "/admin/api/v1/auth/me", token)
+	assertUnauthorized(t, recMe)
+
+	// A fresh login still works; only the revoked session is dead.
+	fresh := adminLogin(t, e, testAdminUsername, testAdminPassword)
+	recMe2 := doGetAdmin(e, "/admin/api/v1/auth/me", fresh)
+	assertOK(t, recMe2)
 }
 
 // TestAdminChangePassword verifies the change-password route works correctly.
@@ -286,6 +297,9 @@ func TestAdminChangePassword(t *testing.T) {
 	}, token)
 	t.Logf("ChangePassword response: %s", rec.Body.String())
 	assertOK(t, rec)
+
+	// The token issued before the rotation must not survive it.
+	assertUnauthorized(t, doGetAdmin(e, "/admin/api/v1/auth/me", token))
 
 	// Verify old password no longer works.
 	rec2 := doPost(e, "/admin/api/v1/auth/login", map[string]interface{}{
@@ -320,7 +334,16 @@ func TestAdminInitialPasswordMetadataFlow(t *testing.T) {
 	_ = data.SetSetting(mdb.SettingGroupSystem, mdb.SettingKeyInitAdminPasswordFetched, "false", mdb.SettingTypeBool)
 	_ = data.SetSetting(mdb.SettingGroupSystem, mdb.SettingKeyInitAdminPasswordChanged, "false", mdb.SettingTypeBool)
 
-	recHash := doGet(e, "/admin/api/v1/auth/init-password-hash")
+	// The fingerprint endpoint is a credential verifier, so it must not answer
+	// before authentication.
+	reqAnon := httptest.NewRequest(http.MethodGet, "/admin/api/v1/auth/init-password-hash", nil)
+	recAnon := httptest.NewRecorder()
+	e.ServeHTTP(recAnon, reqAnon)
+	assertUnauthorized(t, recAnon)
+
+	token := adminLogin(t, e, testAdminUsername, initPassword)
+
+	recHash := doGetAdmin(e, "/admin/api/v1/auth/init-password-hash", token)
 	respHash := assertOK(t, recHash)
 	hashData, _ := respHash["data"].(map[string]interface{})
 	if got := hashData["password_hash"]; got != data.HashInitialAdminPassword(initPassword) {
@@ -329,8 +352,6 @@ func TestAdminInitialPasswordMetadataFlow(t *testing.T) {
 	if got, _ := hashData["password_changed"].(bool); got {
 		t.Fatalf("expected password_changed=false before change, got true")
 	}
-
-	token := adminLogin(t, e, testAdminUsername, initPassword)
 
 	recFetch := doGetAdmin(e, "/admin/api/v1/auth/init-password", token)
 	if recFetch.Code != http.StatusNotFound {
@@ -360,7 +381,11 @@ func TestAdminInitialPasswordMetadataFlow(t *testing.T) {
 	}, token)
 	assertOK(t, recChange)
 
-	recHash2 := doGet(e, "/admin/api/v1/auth/init-password-hash")
+	// The password change revoked the session it was made with.
+	assertUnauthorized(t, doGetAdmin(e, "/admin/api/v1/auth/me", token))
+	token = adminLogin(t, e, testAdminUsername, "new-pass-789")
+
+	recHash2 := doGetAdmin(e, "/admin/api/v1/auth/init-password-hash", token)
 	respHash2 := assertOK(t, recHash2)
 	hashData2, _ := respHash2["data"].(map[string]interface{})
 	if got, _ := hashData2["password_changed"].(bool); !got {

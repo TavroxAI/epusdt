@@ -419,9 +419,21 @@ func (s *Scanner) poll() {
 		return
 	}
 
+	// Settle only blocks that have reached chains.min_confirmations. The tail is
+	// not skipped: the next poll picks it up once it is deeper, so a reorg that
+	// removes a transfer is caught before the order is marked paid.
+	confirmedNum := latestNum
+	if depth := minConfirmationsFor(mdb.NetworkTron); depth > 1 {
+		confirmedNum = confirmedBlockNumber(latestNum, depth)
+		if confirmedNum <= s.lastBlock {
+			data.RecordRpcNodeSuccess(s.nodeID)
+			return
+		}
+	}
+
 	tokenMap := loadTronTRC20TokenMap()
 	hadBlockFetchError := false
-	for num := s.lastBlock + 1; num <= latestNum; num++ {
+	for num := s.lastBlock + 1; num <= confirmedNum; num++ {
 		var block *Block
 		if num == latestNum {
 			block = latest

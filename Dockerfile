@@ -14,6 +14,10 @@ RUN go build -trimpath -ldflags="-s -w -X github.com/GMWalletApp/epusdt/config.B
 
 FROM alpine:latest AS runner
 ENV TZ=Asia/Shanghai
+# The first-run wizard binds loopback by default. A container is normally installed
+# through its published port, so the image opts in explicitly here; overriding this
+# to an empty value keeps the wizard local to the container.
+ENV EPUSDT_INSTALL_ADDR=:8000
 RUN apk --no-cache add ca-certificates tzdata
 ARG API_RATE_URL=""
 

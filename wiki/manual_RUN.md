@@ -157,3 +157,14 @@ Epusdt version(0.0.2) Powered by GMWalletApp https://github.com/GMWalletApp/epus
 ## 其他注意事项
 - 1.所有`.env`配置文件有了修改后都需要重启supervisor进程 `supervisorctl restart epusdt`
 - 2.教程所示的目录均为参考，请勿1:1照抄，根据自己实际情况来
+- 3.首次运行的安装向导（`/install`）默认只监听 `127.0.0.1:8000`，因为安装完成前它没有认证。裸机安装时直接在本机浏览器打开 `http://127.0.0.1:8000/install` 即可；如果必须从其它机器访问，显式放开端口：
+  ```bash
+  EPUSDT_INSTALL_ADDR=:8000 ./epusdt http start
+  ```
+  初始管理员密码不再通过 HTTP 响应返回，只在控制台输出一次，请及时保存。
+- 4.如果前面还有一层 nginx 之类的反向代理，为了让商户 API key 的 IP 白名单和后台登录限制拿到真实客户端地址，在 `.env` 里声明代理地址：
+  ```dotenv
+  trusted_proxies=127.0.0.1,10.0.0.0/8
+  ```
+  不配置时只采信来自回环 / 内网对端的 `X-Forwarded-For`、`X-Real-IP`。
+

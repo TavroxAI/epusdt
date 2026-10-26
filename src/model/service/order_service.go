@@ -230,6 +230,12 @@ func CreateTransaction(req *request.CreateTransactionRequest, apiKey *mdb.ApiKey
 	if err := security.ValidatePublicHTTPURL(notifyURL); err != nil {
 		return nil, constant.NotifyURLErr
 	}
+	// redirect_url is merchant-controlled and ends up in window.location.href on
+	// the cashier page, which shares an origin with the admin console: only an
+	// empty value or an absolute http(s) target may be stored.
+	if err := validateMerchantRedirectURL(req.RedirectUrl); err != nil {
+		return nil, err
+	}
 	paymentType := mdb.PaymentTypeGmpay
 	if strings.EqualFold(req.PaymentType, mdb.PaymentTypeEpay) {
 		paymentType = mdb.PaymentTypeEpay

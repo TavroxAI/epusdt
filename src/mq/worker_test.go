@@ -23,8 +23,16 @@ import (
 	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
+	"github.com/GMWalletApp/epusdt/util/security"
 	"github.com/GMWalletApp/epusdt/util/sign"
 )
+
+// TestMain relaxes the callback client's address policy: these tests deliver
+// callbacks to httptest servers listening on loopback, which production refuses.
+func TestMain(m *testing.M) {
+	security.AllowNonPublicForTest(true)
+	os.Exit(m.Run())
+}
 
 func TestProcessExpiredOrdersExpiresWaitingOrdersAndReleasesLocks(t *testing.T) {
 	cleanup := testutil.SetupTestDatabases(t)

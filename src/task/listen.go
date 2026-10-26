@@ -27,6 +27,11 @@ func Start() {
 	go StartTonBlockScannerListener()
 	go StartAptosLedgerScannerListener()
 
+	// Observed EVM transfers wait here until their block reaches the configured
+	// settlement depth, so a transfer that a reorg removes never becomes a paid
+	// order with a delivered callback.
+	startEvmCreditDrainers()
+
 	c := cron.New()
 
 	// Solana polling

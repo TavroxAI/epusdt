@@ -199,11 +199,23 @@ func runEvmNativeWsLoop(ctx context.Context, network, logPrefix string, node mdb
 				}
 				lastProgress = time.Now()
 				number := head.Number.Uint64()
-				if number <= lastScanned {
+				// Only scan blocks that have reached the configured depth. Blocks
+				// near the tip are picked up by a later head, so nothing is skipped
+				// and no transfer is ever settled on a block that can still be
+				// reorganised away.
+				target := number
+				if depth := minConfirmationsFor(network); depth > 1 {
+					confirmed := confirmedBlockNumber(int64(number), depth)
+					if confirmed <= 0 {
+						continue
+					}
+					target = uint64(confirmed)
+				}
+				if target <= lastScanned {
 					continue
 				}
-				scanEvmNativeBlockRange(ctx, client, network, logPrefix, token, watched, lastScanned+1, number)
-				lastScanned = number
+				scanEvmNativeBlockRange(ctx, client, network, logPrefix, token, watched, lastScanned+1, target)
+				lastScanned = target
 			case err := <-sub.Err():
 				if err != nil {
 					log.Sugar.Warnf("%s newHeads subscription error: %v, reconnecting", logPrefix, err)
@@ -246,9 +258,21 @@ func catchUpEvmNativeBlocks(ctx context.Context, client *ethclient.Client, netwo
 	if latest > evmNativeCatchUpBlocks {
 		from = latest - evmNativeCatchUpBlocks + 1
 	}
-	log.Sugar.Infof("%s catching up native transfers in blocks %d..%d", logPrefix, from, latest)
-	scanEvmNativeBlockRange(ctx, client, network, logPrefix, token, watched, from, latest)
-	return latest
+	// Same depth rule as the live loop: never scan into the unconfirmed tail.
+	to := latest
+	if depth := minConfirmationsFor(network); depth > 1 {
+		confirmed := confirmedBlockNumber(int64(latest), depth)
+		if confirmed <= 0 {
+			return 0
+		}
+		to = uint64(confirmed)
+	}
+	if to < from {
+		return to
+	}
+	log.Sugar.Infof("%s catching up native transfers in blocks %d..%d", logPrefix, from, to)
+	scanEvmNativeBlockRange(ctx, client, network, logPrefix, token, watched, from, to)
+	return to
 }
 
 func scanEvmNativeBlockRange(ctx context.Context, client *ethclient.Client, network, logPrefix string, token mdb.ChainToken, watched *evmNativeWatchList, from, to uint64) {

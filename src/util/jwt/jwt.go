@@ -18,6 +18,9 @@ const DefaultExpiration = 24 * time.Hour
 type AdminClaims struct {
 	AdminUserID uint64 `json:"uid"`
 	Username    string `json:"usr"`
+	// SessionVersion must match the admin_users row on every request, so a
+	// logout or password change (which bump it) revokes already-issued tokens.
+	SessionVersion int64 `json:"ver"`
 	jwt.RegisteredClaims
 }
 
@@ -40,15 +43,18 @@ func EnsureSecret() (string, error) {
 	return secret, nil
 }
 
-// Sign returns a signed JWT for the given admin user.
-func Sign(userID uint64, username string) (string, error) {
+// Sign returns a signed JWT for the given admin user. sessionVersion is the
+// user's current admin_users.session_version; CheckAdminJWT rejects the token
+// once that value moves.
+func Sign(userID uint64, username string, sessionVersion int64) (string, error) {
 	secret, err := EnsureSecret()
 	if err != nil {
 		return "", err
 	}
 	claims := AdminClaims{
-		AdminUserID: userID,
-		Username:    username,
+		AdminUserID:    userID,
+		Username:       username,
+		SessionVersion: sessionVersion,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(DefaultExpiration)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),

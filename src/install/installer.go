@@ -44,8 +44,25 @@ import (
 )
 
 // DefaultInstallAddr is the listen address used by the install API.
-// Matches the default http_listen so no extra port is needed.
-const DefaultInstallAddr = ":8000"
+//
+// It is loopback only: the wizard has no authentication by design (nobody can log
+// in before an account exists), so it must not be reachable from the network by
+// default. Deployments that complete setup over the network — containers
+// publishing port 8000, for example — must opt in explicitly with
+// EPUSDT_INSTALL_ADDR (the image does).
+const DefaultInstallAddr = "127.0.0.1:8000"
+
+// InstallAddrEnvVar lets an operator publish the first-run wizard beyond loopback.
+const InstallAddrEnvVar = "EPUSDT_INSTALL_ADDR"
+
+// ListenAddr returns the address the install wizard should bind: the explicit
+// opt-in from the environment when present, otherwise loopback.
+func ListenAddr() string {
+	if addr := strings.TrimSpace(os.Getenv(InstallAddrEnvVar)); addr != "" {
+		return addr
+	}
+	return DefaultInstallAddr
+}
 
 // InstallRequest is the payload submitted by the install form.
 // All fields are optional except AppURI; omitted fields fall back to InstallDefaults().
@@ -196,6 +213,9 @@ func (h *installHandler) Submit(c echo.Context) error {
 	if req.HttpBindPort != 0 && (req.HttpBindPort < 1 || req.HttpBindPort > 65535) {
 		return c.JSON(http.StatusBadRequest, map[string]interface{}{"error": "http_bind_port must be between 1 and 65535"})
 	}
+	if err := validateInstallFields(req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]interface{}{"error": err.Error()})
+	}
 	d := InstallDefaults()
 	if strings.TrimSpace(req.AppName) == "" {
 		req.AppName = d.AppName
@@ -231,9 +251,15 @@ func (h *installHandler) Submit(c echo.Context) error {
 	}
 
 	go func() { close(h.done) }()
+	// The generated administrator password is never part of the HTTP response:
+	// anybody who can reach the wizard during the deployment window would
+	// otherwise receive working credentials. It is printed once to the local
+	// console instead, next to the same notice the bootstrap path prints.
+	if strings.TrimSpace(initPassword) != "" {
+		printInitialAdminPassword(initPassword)
+	}
 	return c.JSON(http.StatusOK, InstallSubmitResponse{
-		Message:      "install complete, starting server…",
-		InitPassword: initPassword,
+		Message: "install complete, starting server…",
 	})
 }
 
@@ -285,6 +311,79 @@ var formControlledKeys = map[string]bool{
 	"runtime_root_path": true,
 	"log_save_path":     true,
 	"install":           true,
+}
+
+// printInitialAdminPassword is a variable so tests can capture the console
+// notice without a terminal.
+var printInitialAdminPassword = func(password string) {
+	color.Yellow.Printf("[install] initial admin password: %s\n", password)
+	color.Yellow.Println("[install] save this now; it is not shown again and is not served over HTTP")
+}
+
+// validateInstallFields rejects submitted values that cannot be represented as a
+// single line of the generated .env. The form's strings are substituted verbatim
+// into the line-oriented config template, so an embedded newline would append an
+// extra key of the submitter's choosing (for example a gmpay_signing_key, which is
+// the seed every merchant notification is signed with) to the config that every
+// later startup reads.
+func validateInstallFields(r *InstallRequest) error {
+	fields := []struct {
+		key   string
+		value string
+	}{
+		{"app_name", r.AppName},
+		{"app_uri", r.AppURI},
+		{"http_bind_addr", r.HttpBindAddr},
+	}
+	for _, field := range fields {
+		if strings.ContainsAny(field.value, "\r\n\x00") {
+			return fmt.Errorf("%s must not contain line breaks or NUL bytes", field.key)
+		}
+	}
+	if err := validateInstallRuntimePath("runtime_root_path", r.RuntimeRootPath); err != nil {
+		return err
+	}
+	return validateInstallRuntimePath("log_save_path", r.LogSavePath)
+}
+
+// validateInstallRuntimePath keeps the runtime directory inside the deployment.
+//
+// The wizard is unauthenticated, so an absolute path (or a Windows drive/UNC
+// path, which a Linux host would still copy verbatim into .env for a Windows
+// deployment) lets the caller point the runtime SQLite database and the daily log
+// file at a location they control. On Windows a UNC path additionally makes the
+// service authenticate against an attacker-controlled SMB host, leaking the
+// service account's NetNTLMv2 response.
+func validateInstallRuntimePath(key, value string) error {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	if strings.ContainsAny(trimmed, "\r\n\x00") {
+		return fmt.Errorf("%s must not contain line breaks or NUL bytes", key)
+	}
+	// Windows volume ("C:\...", "C:/...") and UNC ("\\host\share", "//host/share")
+	// are rejected on every platform: the value is written to .env unchanged and
+	// may be consumed by a Windows deployment.
+	if len(trimmed) >= 2 && isWindowsDriveLetter(trimmed[0]) && trimmed[1] == ':' {
+		return fmt.Errorf("%s must be a relative path", key)
+	}
+	if strings.HasPrefix(trimmed, `\\`) || strings.HasPrefix(trimmed, "//") {
+		return fmt.Errorf("%s must be a relative path, not a network share", key)
+	}
+	if filepath.IsAbs(trimmed) {
+		return fmt.Errorf("%s must be a relative path", key)
+	}
+	for _, segment := range strings.FieldsFunc(trimmed, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if segment == ".." {
+			return fmt.Errorf("%s must not contain '..' segments", key)
+		}
+	}
+	return nil
+}
+
+func isWindowsDriveLetter(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
 
 type envTemplateData struct {
@@ -368,14 +467,24 @@ func resolveEnvFileMode(oldMode os.FileMode, exists bool) os.FileMode {
 
 // verifyEnvContent enforces the post-write contract before the temporary file is
 // renamed into place: every expected key appears exactly once, no key is
-// duplicated, and no line has an empty key. A rewrite that would drop, duplicate
-// or corrupt a key is refused instead of replacing the operator's config.
-func verifyEnvContent(content string, expectedKeys []string) error {
+// duplicated, no line has an empty key, and no key outside the allowed set (the
+// template's own keys plus the keys preserved from the previous file) appears at
+// all. The last rule is the one that matters for a line-oriented format: it is
+// the only check that does not trust the document being verified to describe
+// itself.
+func verifyEnvContent(content string, expectedKeys, allowedKeys []string) error {
 	parsed := parseEnvLines(content)
+	allowed := make(map[string]bool, len(allowedKeys))
+	for _, key := range allowedKeys {
+		allowed[key] = true
+	}
 	counts := make(map[string]int, len(parsed))
 	for _, line := range parsed {
 		if line.key == "" {
 			return fmt.Errorf("generated config line %d has no key", line.lineIndex+1)
+		}
+		if !allowed[line.key] {
+			return fmt.Errorf("generated config contains unexpected key %q", line.key)
 		}
 		counts[line.key]++
 	}
@@ -461,6 +570,12 @@ func readEnvFile(path string) (content string, mode os.FileMode, exists bool, er
 //     policy) before the rewrite.
 //   - The content is verified after it is written and before it is renamed.
 func writeEnvFile(path string, r *InstallRequest, installEnabled bool) error {
+	// The template interpolates these fields verbatim into a line-oriented file,
+	// so refuse multi-line values before anything is written, not just in the
+	// HTTP handler: this function is the sink.
+	if err := validateInstallFields(r); err != nil {
+		return err
+	}
 	oldContent, oldMode, oldExists, err := readEnvFile(path)
 	if err != nil {
 		return err
@@ -520,26 +635,32 @@ func writeEnvFile(path string, r *InstallRequest, installEnabled bool) error {
 		preservedByKey[line.key] = line.value
 	}
 	lines := strings.Split(buf.String(), "\n")
-	renderedKeys := make([]string, 0, len(lines))
-	rendered := make(map[string]bool, len(lines))
 	for _, line := range parseEnvLines(buf.String()) {
 		if line.key == "" {
 			return errors.New("render env template: line without a key")
 		}
-		renderedKeys = append(renderedKeys, line.key)
-		rendered[line.key] = true
 		if value, ok := preservedByKey[line.key]; ok {
 			lines[line.lineIndex] = line.key + "=" + value
 		}
 	}
 
+	templateKeys := make(map[string]bool, len(envTemplateKeys))
+	for _, key := range envTemplateKeys {
+		templateKeys[key] = true
+	}
+
 	// Keys the template does not know must survive the rewrite: append them in
-	// their original order, exactly once each.
-	expectedKeys := make([]string, 0, len(renderedKeys)+len(preserved))
-	expectedKeys = append(expectedKeys, renderedKeys...)
+	// their original order, exactly once each. The expected and allowed key sets
+	// come from the template text and the previous file, never from the rendered
+	// document, so a value that smuggles in an extra line cannot vouch for it.
+	expectedKeys := make([]string, 0, len(envTemplateKeys)+len(preserved))
+	expectedKeys = append(expectedKeys, envTemplateKeys...)
+	allowedKeys := make([]string, 0, len(envTemplateKeys)+len(preserved))
+	allowedKeys = append(allowedKeys, envTemplateKeys...)
 	appended := make([]string, 0, len(preserved))
 	for _, line := range preserved {
-		if rendered[line.key] {
+		allowedKeys = append(allowedKeys, line.key)
+		if templateKeys[line.key] {
 			continue
 		}
 		appended = append(appended, line.key+"="+line.value)
@@ -578,7 +699,7 @@ func writeEnvFile(path string, r *InstallRequest, installEnabled bool) error {
 	if err != nil {
 		return fmt.Errorf("read temp config file: %w", err)
 	}
-	if err = verifyEnvContent(string(written), expectedKeys); err != nil {
+	if err = verifyEnvContent(string(written), expectedKeys, allowedKeys); err != nil {
 		return err
 	}
 
@@ -659,7 +780,9 @@ func closeInstallDatabases() {
 	}
 }
 
-var envTemplate = template.Must(template.New("env").Parse(`app_name={{.AppName}}
+// envTemplateRaw is the .env skeleton the install form renders. It is kept as a
+// plain constant so envTemplateKeys can be derived from the template text itself.
+const envTemplateRaw = `app_name={{.AppName}}
 app_uri={{.AppURI}}
 log_level=info
 http_access_log=false
@@ -694,6 +817,37 @@ order_notice_max_retry={{.OrderNoticeMaxRetry}}
 
 api_rate_url=
 
+# Comma-separated proxy IPs / CIDRs whose forwarding headers are trusted.
+# Empty trusts them only from loopback/link-local/private peers.
+trusted_proxies=
+
 # Set to true to re-run the install wizard on next startup.
 install={{.InstallValue}}
-`))
+`
+
+var envTemplate = template.Must(template.New("env").Parse(envTemplateRaw))
+
+// envTemplateKeys are the keys the template renders, extracted from the template
+// text rather than from a rendered document. Deriving them from a rendered
+// document would let a form value that smuggles in an extra line vouch for its
+// own key, because verifyEnvContent's expected set is then built from the very
+// content it is supposed to police.
+var envTemplateKeys = envTemplateKeyNames(envTemplateRaw)
+
+// envTemplateKeyNames returns the key of every key=value line in raw, skipping
+// blank lines and comments.
+func envTemplateKeyNames(raw string) []string {
+	keys := make([]string, 0, 32)
+	for _, line := range strings.Split(raw, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		key, _, ok := strings.Cut(trimmed, "=")
+		if !ok {
+			continue
+		}
+		keys = append(keys, strings.TrimSpace(key))
+	}
+	return keys
+}

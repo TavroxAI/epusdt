@@ -50,7 +50,7 @@ func buildPublicRedirectURL(order *mdb.Orders) string {
 	if order == nil {
 		return ""
 	}
-	raw := strings.TrimSpace(order.RedirectUrl)
+	raw := safeMerchantRedirectURL(order.RedirectUrl)
 	if raw == "" || !isEPayOrder(order) {
 		return raw
 	}
@@ -123,6 +123,11 @@ func appendQueryParams(rawURL string, params map[string]string) (string, error) 
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
 		return "", constant.OrderRedirectURLErr
+	}
+	// The server-side hop writes this into a Location header, so a legacy row
+	// holding a non-http(s) target is refused rather than relayed.
+	if err := validateMerchantRedirectURL(rawURL); err != nil {
+		return "", err
 	}
 
 	targetURL, err := url.Parse(rawURL)

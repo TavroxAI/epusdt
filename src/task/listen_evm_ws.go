@@ -105,8 +105,25 @@ func runEvmWsLogListener(ctx context.Context, network string, logPrefix string, 
 
 		log.Sugar.Infof("%s connected, subscribed to Transfer logs using WSS node %s", logPrefix, nodeLabel)
 
+		// Publish the live connection as the head source for this network's
+		// confirmation-depth queue, and withdraw it when the connection ends so the
+		// queue waits instead of settling against a dead client.
+		setEvmHeadSource(network, func(hctx context.Context) (int64, error) {
+			ctx, cancel := context.WithTimeout(hctx, evmStatsHeaderTimeout)
+			defer cancel()
+			header, err := client.HeaderByNumber(ctx, nil)
+			if err != nil {
+				return 0, err
+			}
+			if header == nil || header.Number == nil || !header.Number.IsInt64() {
+				return 0, errors.New("head unavailable")
+			}
+			return header.Number.Int64(), nil
+		})
+
 		connectedAt := time.Now()
 		recvErr := recvLoop(ctx, client, sub, logsCh, network, logPrefix, handleLog)
+		setEvmHeadSource(network, nil)
 
 		if ctx.Err() != nil {
 			return

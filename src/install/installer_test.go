@@ -242,8 +242,16 @@ func TestInstallServerServesSPAOnInstallRoute(t *testing.T) {
 	}
 }
 
-func TestInstallAPISubmitReturnsInitialPassword(t *testing.T) {
+// TestInstallAPISubmitDoesNotReturnInitialPassword covers vuln-0014: the wizard is
+// unauthenticated, so returning the generated administrator password to whoever
+// submitted the form hands out credentials for the payment gateway. It is printed
+// to the local console instead.
+func TestInstallAPISubmitDoesNotReturnInitialPassword(t *testing.T) {
 	resetInstallTestState(t)
+
+	var printed []string
+	restore := captureInitialAdminPassword(t, &printed)
+	defer restore()
 
 	dir := t.TempDir()
 	envPath := filepath.Join(dir, ".env")
@@ -260,11 +268,14 @@ func TestInstallAPISubmitReturnsInitialPassword(t *testing.T) {
 	if got, _ := body["message"].(string); got == "" {
 		t.Fatalf("expected success message, got body=%v", body)
 	}
-	initPassword, _ := body["init_password"].(string)
-	if strings.TrimSpace(initPassword) == "" {
-		t.Fatalf("expected non-empty init_password, got body=%v", body)
+	if got, ok := body["init_password"]; ok {
+		t.Fatalf("response leaked init_password: %v", got)
 	}
 	assertDoneClosed(t, h.done)
+
+	if len(printed) != 1 || strings.TrimSpace(printed[0]) == "" {
+		t.Fatalf("expected one console password notice, got %v", printed)
+	}
 
 	data, err := os.ReadFile(envPath)
 	if err != nil {
@@ -282,8 +293,15 @@ func TestInstallAPISubmitReturnsInitialPassword(t *testing.T) {
 	}
 }
 
-func TestInstallAPISubmitRepeatInstallReturnsSamePasswordWhilePlaintextExists(t *testing.T) {
+// TestInstallAPISubmitRepeatInstallPrintsSamePasswordWhilePlaintextExists keeps the
+// recovery path: a repeat install before the operator saved the password still
+// prints it, but only to the console.
+func TestInstallAPISubmitRepeatInstallPrintsSamePasswordWhilePlaintextExists(t *testing.T) {
 	resetInstallTestState(t)
+
+	var printed []string
+	restore := captureInitialAdminPassword(t, &printed)
+	defer restore()
 
 	dir := t.TempDir()
 	envPath := filepath.Join(dir, ".env")
@@ -294,11 +312,6 @@ func TestInstallAPISubmitRepeatInstallReturnsSamePasswordWhilePlaintextExists(t 
 	if rec1.Code != http.StatusOK {
 		t.Fatalf("first install status = %d, want 200; body: %s", rec1.Code, rec1.Body.String())
 	}
-	body1 := decodeBody(t, rec1)
-	password1, _ := body1["init_password"].(string)
-	if strings.TrimSpace(password1) == "" {
-		t.Fatalf("expected first init_password, got body=%v", body1)
-	}
 	assertDoneClosed(t, h1.done)
 
 	e2, h2 := newInstallTestAPI(envPath)
@@ -306,16 +319,25 @@ func TestInstallAPISubmitRepeatInstallReturnsSamePasswordWhilePlaintextExists(t 
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("second install status = %d, want 200; body: %s", rec2.Code, rec2.Body.String())
 	}
-	body2 := decodeBody(t, rec2)
-	password2, _ := body2["init_password"].(string)
-	if password2 != password1 {
-		t.Fatalf("expected repeat install to return same init_password %q, got %q", password1, password2)
+	if got, ok := decodeBody(t, rec2)["init_password"]; ok {
+		t.Fatalf("repeat install response leaked init_password: %v", got)
 	}
 	assertDoneClosed(t, h2.done)
+
+	if len(printed) != 2 {
+		t.Fatalf("expected a console password notice for each install, got %v", printed)
+	}
+	if printed[0] != printed[1] {
+		t.Fatalf("repeat install printed a different password: %q vs %q", printed[0], printed[1])
+	}
 }
 
 func TestInstallAPISubmitRepeatInstallOmitsPasswordAfterPasswordChange(t *testing.T) {
 	resetInstallTestState(t)
+
+	var printed []string
+	restore := captureInitialAdminPassword(t, &printed)
+	defer restore()
 
 	dir := t.TempDir()
 	envPath := filepath.Join(dir, ".env")
@@ -343,6 +365,22 @@ func TestInstallAPISubmitRepeatInstallOmitsPasswordAfterPasswordChange(t *testin
 		t.Fatalf("expected success message, got body=%v", body2)
 	}
 	assertDoneClosed(t, h2.done)
+
+	// Only the first install printed a password; the retired plaintext is gone.
+	if len(printed) != 1 {
+		t.Fatalf("expected only the first install to print a password, got %v", printed)
+	}
+}
+
+// captureInitialAdminPassword swaps the console notice for a recorder.
+func captureInitialAdminPassword(t *testing.T, sink *[]string) func() {
+	t.Helper()
+
+	original := printInitialAdminPassword
+	printInitialAdminPassword = func(password string) {
+		*sink = append(*sink, password)
+	}
+	return func() { printInitialAdminPassword = original }
 }
 
 func TestInstallAPISubmitInitFailureKeepsInstallMode(t *testing.T) {
@@ -352,7 +390,13 @@ func TestInstallAPISubmitInitFailureKeepsInstallMode(t *testing.T) {
 	envPath := filepath.Join(dir, ".env")
 
 	e, h := newInstallTestAPI(envPath)
-	payload := `{"app_name":"testapp","app_uri":"http://10.0.0.1:8000","http_bind_addr":"0.0.0.0","http_bind_port":8000,"runtime_root_path":"/dev/null/runtime","order_expiration_time":10,"order_notice_max_retry":1}`
+	// A file where the runtime directory should be makes the database setup fail.
+	// The path itself is relative on purpose: absolute paths are rejected by the
+	// form validator (the wizard must not write outside the deployment).
+	if err := os.WriteFile(filepath.Join(dir, "runtime"), []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("prepare blocked runtime path: %v", err)
+	}
+	payload := `{"app_name":"testapp","app_uri":"http://10.0.0.1:8000","http_bind_addr":"0.0.0.0","http_bind_port":8000,"runtime_root_path":"./runtime","order_expiration_time":10,"order_notice_max_retry":1}`
 	rec := submitInstallRequest(t, e, payload)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500; body: %s", rec.Code, rec.Body.String())
@@ -695,7 +739,9 @@ func TestWriteEnvFileWarnsWhenEnvValueWins(t *testing.T) {
 
 // TestWriteEnvFileRefusesDuplicateKey covers the pre-rename self check: a form
 // value that would inject a second line for an existing key must abort the write
-// and leave the current .env untouched.
+// and leave the current .env untouched. The submit validator rejects the newline
+// before this point, so the assertion here is that no path reaches the sink and
+// rewrites the operator's config half-way.
 func TestWriteEnvFileRefusesDuplicateKey(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".env")

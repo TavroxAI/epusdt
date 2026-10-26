@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/mdb"
@@ -256,6 +257,46 @@ func VerifyPassword(hash, plain string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(plain)) == nil
 }
 
+// dummyPasswordHash is used to keep the cost of an unknown-username login equal
+// to the cost of a wrong-password login. Without it, a missing row returns before
+// bcrypt runs and the response time reveals whether the account exists.
+var (
+	dummyPasswordHashOnce sync.Once
+	dummyPasswordHash     string
+)
+
+func compareAgainstDummyHash(plain string) {
+	dummyPasswordHashOnce.Do(func() {
+		if h, err := bcrypt.GenerateFromPassword([]byte(randomAdminPassword()), bcrypt.DefaultCost); err == nil {
+			dummyPasswordHash = string(h)
+		}
+	})
+	_ = bcrypt.CompareHashAndPassword([]byte(dummyPasswordHash), []byte(plain))
+}
+
+// VerifyLoginPassword verifies a login password in constant work regardless of
+// whether the account exists: an empty hash (unknown username) still runs one
+// bcrypt comparison against a throwaway hash.
+func VerifyLoginPassword(hash, plain string) bool {
+	if strings.TrimSpace(hash) == "" {
+		compareAgainstDummyHash(plain)
+		return false
+	}
+	return VerifyPassword(hash, plain)
+}
+
+// BumpAdminSessionVersion invalidates every token issued for the user so far.
+// It is called on logout and on password change; CheckAdminJWT compares the
+// token's stamped version against this value on every request.
+func BumpAdminSessionVersion(id uint64) error {
+	if id == 0 {
+		return nil
+	}
+	return dao.Mdb.Model(&mdb.AdminUser{}).
+		Where("id = ?", id).
+		Update("session_version", gorm.Expr("session_version + 1")).Error
+}
+
 // GetAdminUserByUsername returns the row for a username (case-insensitive).
 func GetAdminUserByUsername(username string) (*mdb.AdminUser, error) {
 	u := new(mdb.AdminUser)
@@ -285,7 +326,10 @@ func UpdateAdminUserPassword(id uint64, newPlain string) error {
 	err = dao.Mdb.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&mdb.AdminUser{}).
 			Where("id = ?", id).
-			Update("password_hash", hash).Error; err != nil {
+			Updates(map[string]interface{}{
+				"password_hash":   hash,
+				"session_version": gorm.Expr("session_version + 1"),
+			}).Error; err != nil {
 			return err
 		}
 

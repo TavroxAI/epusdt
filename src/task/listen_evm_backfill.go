@@ -253,6 +253,13 @@ func processEvmBackfillLogs(ctx context.Context, client *ethclient.Client, netwo
 		if vLog.Topics[0] != transferEventHash {
 			continue
 		}
+		// A log the chain has already removed belongs to an orphaned block; it
+		// must never settle an order.
+		if vLog.Removed {
+			log.Sugar.Warnf("%s ignoring removed Transfer log block=%d tx=%s (chain reorg)",
+				logPrefix, vLog.BlockNumber, vLog.TxHash.Hex())
+			continue
+		}
 
 		toAddr := common.HexToAddress(vLog.Topics[2].Hex())
 		if !isWatchedRecipient(toAddr) {

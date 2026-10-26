@@ -54,6 +54,10 @@ func resolveEPayTypeSelector(rawType string) (string, string, bool, error) {
 
 // RegisterRoute 路由注册
 func RegisterRoute(e *echo.Echo) {
+	// Decide how the client address is derived before any handler reads it: the
+	// per-key IP allow-list and the admin login limiter both trust ctx.RealIP().
+	middleware.ConfigureIPExtractor(e)
+
 	e.POST("/", func(c echo.Context) error {
 		return c.String(http.StatusOK, "hello epusdt, https://github.com/GMwalletApp/epusdt")
 	})
@@ -267,10 +271,12 @@ func registerAdminRoutes(e *echo.Echo) {
 
 	// Public (no JWT)
 	adminV1.POST("/auth/login", admin.Ctrl.Login)
-	adminV1.GET("/auth/init-password-hash", admin.Ctrl.GetInitialPasswordHash)
 
 	// Authenticated
 	authed := adminV1.Group("", middleware.CheckAdminJWT())
+	// The initial-password fingerprint is a verifier for the admin credential, so
+	// it is only served to an authenticated console session.
+	authed.GET("/auth/init-password-hash", admin.Ctrl.GetInitialPasswordHash)
 	authed.POST("/auth/logout", admin.Ctrl.Logout)
 	authed.GET("/auth/me", admin.Ctrl.Me)
 	authed.POST("/auth/password", admin.Ctrl.ChangePassword)

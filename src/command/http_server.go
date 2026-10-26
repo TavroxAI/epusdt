@@ -46,7 +46,7 @@ var startCmd = &cobra.Command{
 		// down so bootstrap.InitApp() can read it normally on the same port.
 		if config.NeedsInstall() {
 			envPath, _ := config.ResolveConfigPath()
-			install.RunInstallServer(install.DefaultInstallAddr, envPath)
+			install.RunInstallServer(install.ListenAddr(), envPath)
 		}
 		bootstrap.InitApp()
 		printBanner()

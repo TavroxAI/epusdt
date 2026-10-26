@@ -375,6 +375,27 @@ func GetAppUri() string {
 	return viper.GetString("app_uri")
 }
 
+// TrustedProxies returns the proxy addresses (bare IP or CIDR) whose forwarding
+// headers are believed. An empty list means "trust them only when the direct peer
+// is this host's own loopback/link-local/private address", which is what a local
+// reverse proxy looks like.
+func TrustedProxies() []string {
+	raw := strings.TrimSpace(viper.GetString("trusted_proxies"))
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv("TRUSTED_PROXIES"))
+	}
+	if raw == "" {
+		return nil
+	}
+	entries := make([]string, 0, 4)
+	for _, part := range strings.Split(raw, ",") {
+		if entry := strings.TrimSpace(part); entry != "" {
+			entries = append(entries, entry)
+		}
+	}
+	return entries
+}
+
 func GetRateApiUrl() string {
 	// settings table wins (admin-configurable); .env and env var remain
 	// as fallbacks for smooth migration from the old layout.

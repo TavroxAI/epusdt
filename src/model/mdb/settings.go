@@ -72,6 +72,54 @@ const (
 	SettingDefaultRateCacheTTL       = 300
 )
 
+// WritableSettings is the allowlist of keys the admin settings API may write or
+// delete. Credential-bearing keys are deliberately absent:
+//
+//   - system.jwt_secret is the HS256 key that signs every admin session, so a
+//     writable value here would let any admin session plant its own signing key,
+//     mint tokens for arbitrary user IDs, and keep access across password
+//     rotation and account deletion;
+//   - system.init_admin_password_* is internal install state, not configuration.
+//
+// Both are also hidden from reads (see data.sensitiveSettingKeys), so writing
+// them was both possible and invisible.
+var WritableSettings = map[string]bool{
+	SettingKeyOrderExpiration: true,
+	SettingKeyAmountPrecision: true,
+	SettingKeySystemLogLevel:  true,
+
+	SettingKeyBrandCheckoutName:       true,
+	SettingKeyBrandSiteName:           true,
+	SettingKeyBrandLogoUrl:            true,
+	SettingKeyBrandSiteTitle:          true,
+	SettingKeyBrandPageTitle:          true,
+	SettingKeyBrandSuccessCopy:        true,
+	SettingKeyBrandPaySuccess:         true,
+	SettingKeyBrandSupportUrl:         true,
+	SettingKeyBrandBackgroundColor:    true,
+	SettingKeyBrandBackgroundImageUrl: true,
+
+	SettingKeyRateForcedRateList:  true,
+	SettingKeyRateAdjustPercent:   true,
+	SettingKeyRateOkxC2cEnabled:   true,
+	SettingKeyRateApiUrl:          true,
+	SettingKeyRateMode:            true,
+	SettingKeyRateCacheTTLSeconds: true,
+
+	SettingKeyEpayDefaultToken:    true,
+	SettingKeyEpayDefaultCurrency: true,
+	SettingKeyEpayDefaultNetwork:  true,
+
+	SettingKeyOkPayEnabled:        true,
+	SettingKeyOkPayShopID:         true,
+	SettingKeyOkPayShopToken:      true,
+	SettingKeyOkPayAPIURL:         true,
+	SettingKeyOkPayCallbackURL:    true,
+	SettingKeyOkPayReturnURL:      true,
+	SettingKeyOkPayTimeoutSeconds: true,
+	SettingKeyOkPayAllowTokens:    true,
+}
+
 type Setting struct {
 	Group       string `gorm:"column:group;size:32;index:settings_group_index" json:"group" enums:"brand,rate,system,epay,okpay" example:"rate"`
 	Key         string `gorm:"column:key;uniqueIndex:settings_key_uindex;size:128" json:"key" example:"rate.forced_rate_list"`

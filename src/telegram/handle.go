@@ -94,12 +94,12 @@ func WalletList(c tb.Context) error {
 			Text:   fmt.Sprintf("[%s] %s [%s]", net, wallet.Address, status),
 			Data:   strutil.MustString(wallet.ID),
 		}
-		bots.Handle(&btnInfo, WalletInfo)
+		registerAdminInline(&btnInfo, WalletInfo)
 		btnList = append(btnList, []tb.InlineButton{btnInfo})
 	}
 
 	addBtn := tb.InlineButton{Text: "添加钱包地址", Unique: "AddWallet"}
-	bots.Handle(&addBtn, func(c tb.Context) error {
+	registerAdminInline(&addBtn, func(c tb.Context) error {
 		chains, err := getEnabledSupportedNetworks()
 		if err != nil {
 			return c.Send("读取支持链失败：" + err.Error())
@@ -115,7 +115,7 @@ func WalletList(c tb.Context) error {
 				Unique: "SelectWalletNetwork",
 				Data:   network,
 			}
-			bots.Handle(&btn, SelectWalletNetwork)
+			registerAdminInline(&btn, SelectWalletNetwork)
 			rows = append(rows, []tb.InlineButton{btn})
 		}
 		return c.EditOrSend(ReplaySelectNetwork, &tb.ReplyMarkup{
@@ -123,7 +123,7 @@ func WalletList(c tb.Context) error {
 		})
 	})
 	refreshBtn := tb.InlineButton{Text: "刷新列表", Unique: "WalletRefresh"}
-	bots.Handle(&refreshBtn, WalletList)
+	registerAdminInline(&refreshBtn, WalletList)
 	btnList = append(btnList, []tb.InlineButton{addBtn, refreshBtn})
 
 	return c.EditOrSend("请选择钱包继续操作", &tb.ReplyMarkup{
@@ -174,10 +174,10 @@ func WalletInfo(c tb.Context) error {
 		Unique: "WalletList",
 	}
 
-	bots.Handle(&enableBtn, EnableWallet)
-	bots.Handle(&disableBtn, DisableWallet)
-	bots.Handle(&delBtn, DelWallet)
-	bots.Handle(&backBtn, WalletList)
+	registerAdminInline(&enableBtn, EnableWallet)
+	registerAdminInline(&disableBtn, DisableWallet)
+	registerAdminInline(&delBtn, DelWallet)
+	registerAdminInline(&backBtn, WalletList)
 
 	net := tokenInfo.Network
 	if net == "" {

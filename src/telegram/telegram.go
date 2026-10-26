@@ -9,8 +9,8 @@ import (
 
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/util/log"
+	"github.com/GMWalletApp/epusdt/util/security"
 	tb "gopkg.in/telebot.v3"
-	"gopkg.in/telebot.v3/middleware"
 )
 
 // bots is the single bot instance backing slash-command handlers
@@ -22,6 +22,10 @@ var (
 	bots        *tb.Bot
 	adminChatID int64
 	reloadMu    sync.Mutex
+	// adminHandlers is the whitelisted group every command and inline-button
+	// handler is registered on, so the chat check cannot be forgotten for a new
+	// button.
+	adminHandlers *tb.Group
 )
 
 // BotStart connects the command bot. If no telegram channel is
@@ -76,6 +80,7 @@ func reloadBot(reason string) error {
 		bots.Stop()
 		bots = nil
 	}
+	adminHandlers = nil
 
 	cfg, source, err := loadCommandBotConfig()
 	if err != nil {
@@ -94,10 +99,10 @@ func reloadBot(reason string) error {
 	}
 	newBot, err := tb.NewBot(botSetting)
 	if err != nil {
-		return fmt.Errorf("new bot: %w", err)
+		return fmt.Errorf("new bot: %w", redactedError(err, cfg.BotToken))
 	}
 	if err = newBot.SetCommands(Cmds); err != nil {
-		return fmt.Errorf("set commands: %w", err)
+		return fmt.Errorf("set commands: %w", redactedError(err, cfg.BotToken))
 	}
 	bots = newBot
 	RegisterHandle()
@@ -107,14 +112,68 @@ func reloadBot(reason string) error {
 	return nil
 }
 
-// RegisterHandle wires slash-command and text-message routes. The
-// admin whitelist uses the chat_id from the same channel row.
+// RegisterHandle wires slash-command, text-message and inline-button routes onto
+// one whitelisted group.
+//
+// Every handler — including the wallet menu's inline buttons — must go through
+// adminChatGuard: the buttons carry wallet identifiers, and a forwarded menu used
+// to let a stranger disable, re-enable or delete wallet addresses because the
+// inline handlers were registered on the bot instead of on the whitelisted group.
 func RegisterHandle() {
 	if bots == nil {
 		return
 	}
-	adminOnly := bots.Group()
-	adminOnly.Use(middleware.Whitelist(adminChatID))
-	adminOnly.Handle(START_CMD, WalletList)
-	adminOnly.Handle(tb.OnText, OnTextMessageHandle)
+	admin := bots.Group()
+	admin.Use(adminChatGuard())
+	admin.Handle(START_CMD, WalletList)
+	admin.Handle(tb.OnText, OnTextMessageHandle)
+	adminHandlers = admin
+}
+
+// registerAdminInline attaches an inline-button handler to the whitelisted group.
+func registerAdminInline(btn *tb.InlineButton, handler tb.HandlerFunc) {
+	if bots == nil || btn == nil || adminHandlers == nil {
+		return
+	}
+	adminHandlers.Handle(btn, handler)
+}
+
+// adminChatGuard drops any update that does not come from the configured operator
+// chat. A rejected update is ignored silently: telling a stranger that the chat is
+// not authorized only reveals that the bot is an admin bot.
+func adminChatGuard() tb.MiddlewareFunc {
+	return func(next tb.HandlerFunc) tb.HandlerFunc {
+		return func(c tb.Context) error {
+			if !isAdminChatID(chatIDOf(c)) {
+				log.Sugar.Warnf("[telegram] rejected update from chat=%d: not the configured operator chat", chatIDOf(c))
+				return nil
+			}
+			return next(c)
+		}
+	}
+}
+
+// isAdminChatID reports whether chatID is the configured operator chat.
+func isAdminChatID(chatID int64) bool {
+	return adminChatID != 0 && chatID == adminChatID
+}
+
+func chatIDOf(c tb.Context) int64 {
+	if c == nil {
+		return 0
+	}
+	chat := c.Chat()
+	if chat == nil {
+		return 0
+	}
+	return chat.ID
+}
+
+// redactedError strips the bot token from a client-library error before it can be
+// logged: the token is part of every Bot API URL, so a transport failure quotes it.
+func redactedError(err error, botToken string) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s", security.Redact(err.Error(), botToken))
 }

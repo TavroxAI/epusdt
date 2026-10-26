@@ -138,6 +138,14 @@ func (c *BaseAdminController) UpsertSettings(ctx echo.Context) error {
 			out = append(out, errorResult(item.Key, constant.SettingItemErr))
 			continue
 		}
+		// Credential-bearing keys (system.jwt_secret and the
+		// init_admin_password_* state) are not writable through the API: writing
+		// jwt_secret would let any admin session mint tokens with its own signing
+		// key and outlive password rotation.
+		if !mdb.WritableSettings[key] {
+			out = append(out, errorResult(key, constant.SettingItemErr))
+			continue
+		}
 		value, err := normalizeSettingValue(item.Value)
 		if err != nil {
 			out = append(out, errorResult(key, constant.SettingItemErr))
@@ -432,6 +440,12 @@ func (c *BaseAdminController) DeleteSetting(ctx echo.Context) error {
 	key := strings.TrimSpace(ctx.Param("key"))
 	if key == "" {
 		return c.SucJson(ctx, nil)
+	}
+	// Same allowlist as UpsertSettings: deleting system.jwt_secret would silently
+	// rotate the session signing key, and deleting init_admin_password_* would
+	// rewrite install state the console cannot even display.
+	if !mdb.WritableSettings[key] {
+		return c.FailJson(ctx, constant.SettingItemErr)
 	}
 	if err := data.DeleteSetting(key); err != nil {
 		return c.FailJson(ctx, err)

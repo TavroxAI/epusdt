@@ -51,6 +51,7 @@ var Errno = map[int]string{
 	10045: "order api key unavailable",
 	10046: "failed to build epay return signature",
 	10047: "only the native coin of this chain may omit the contract address",
+	10048: "too many login attempts, try again later",
 }
 
 var (
@@ -102,6 +103,7 @@ var (
 	OrderApiKeyUnavailableErr  = Err(10045)
 	EPayReturnSignatureErr     = Err(10046)
 	EvmNativeTokenErr          = Err(10047)
+	AdminLoginRateLimitedErr   = Err(10048)
 )
 
 type RspError struct {
